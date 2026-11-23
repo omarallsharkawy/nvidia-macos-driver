@@ -456,11 +456,106 @@ static void nvmtl_spvcache_trim_async(NSString *dir) {
     });
 }
 
+static _Atomic unsigned long long gAirAdded;
+static _Atomic int gAirTrimRunning;
+static _Atomic int gAirTrimArmed = 1;
+
+static void nvmtl_aircache_trim_now(const char *dirc) {
+    unsigned long long cap = 128ull * 1024 * 1024;
+    const char *e = getenv("NVMTL_AIRCACHE_MAX_MB");
+    if (e) { unsigned long long v = strtoull(e, NULL, 10); if (!v) { nvlog("aircache: trim disabled by NVMTL_AIRCACHE_MAX_MB=0"); return; } cap = v * 1024ull * 1024; }
+    unsigned long long pct = 80;
+    { const char *t = getenv("NVMTL_AIRCACHE_TARGET_PCT");
+      if (t) { unsigned long long v = strtoull(t, NULL, 10); if (v >= 10 && v <= 99) pct = v; } }
+    unsigned long long target = cap / 100 * pct;
+
+    DIR *dh = opendir(dirc);
+    if (!dh) return;
+    size_t room = 4096, n = 0;
+    nvmtl_spvent *ents = malloc(room * sizeof *ents);
+    unsigned long long total = 0;
+    struct dirent *de; char p[PATH_MAX];
+    while ((de = readdir(dh))) {
+        const size_t nl = strlen(de->d_name);
+        if (de->d_name[0] == '.' || nl < 4 || strcmp(de->d_name + nl - 3, ".ll") != 0) continue;   /* trim .ll only; preserve idx2-*.plist and lk1-*.bin */
+        if (snprintf(p, sizeof p, "%s/%s", dirc, de->d_name) >= (int)sizeof p) continue;
+        struct stat st;
+        if (stat(p, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        total += (unsigned long long)st.st_size;
+        if (!ents) continue;
+        if (n == room) {
+            nvmtl_spvent *r = realloc(ents, room * 2 * sizeof *ents);
+            if (!r) { free(ents); ents = NULL; continue; }
+            ents = r; room *= 2;
+        }
+        ents[n].use = (long long)st.st_mtime; ents[n].size = (unsigned long long)st.st_size; n++;
+    }
+    closedir(dh);
+    if (!ents) return;
+    if (total <= cap || !n) { free(ents); return; }
+    qsort(ents, n, sizeof *ents, nvmtl_spvent_older);
+    unsigned long long need = total - target;
+    unsigned long long slack = need + need / 16;
+    unsigned long long acc = 0; long long cutoff = ents[0].use;
+    for (size_t i = 0; i < n; i++) { acc += ents[i].size; cutoff = ents[i].use; if (acc >= slack) break; }
+    free(ents);
+
+    dh = opendir(dirc);
+    if (!dh) return;
+    unsigned long long freed = 0; unsigned long gone = 0, failed = 0;
+    while ((de = readdir(dh))) {
+        if (freed >= need) break;
+        const size_t nl = strlen(de->d_name);
+        if (de->d_name[0] == '.' || nl < 4 || strcmp(de->d_name + nl - 3, ".ll") != 0) continue;
+        if (snprintf(p, sizeof p, "%s/%s", dirc, de->d_name) >= (int)sizeof p) continue;
+        struct stat st;
+        if (stat(p, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        if ((long long)st.st_mtime > cutoff) continue;
+        if (unlink(p) == 0) { freed += (unsigned long long)st.st_size; gone++; } else failed++;
+    }
+    closedir(dh);
+    if (gone || failed)
+        nvlog("aircache: trimmed %lu .ll files / %llu.%llu MiB (cap %llu MiB, %lu failed)",
+              gone, freed >> 20, ((freed & 0xFFFFFull) * 10) >> 20, cap >> 20, failed);
+}
+
+static void nvmtl_aircache_trim_async(NSString *dir) {
+    if (!dir) return;
+    const unsigned long long rearm = 32ull * 1024 * 1024;
+    if (!atomic_load_explicit(&gAirTrimArmed, memory_order_relaxed) &&
+        atomic_load_explicit(&gAirAdded, memory_order_relaxed) < rearm) return;
+    if (atomic_exchange(&gAirTrimRunning, 1)) return;
+    atomic_store(&gAirTrimArmed, 0);
+    atomic_store(&gAirAdded, 0);
+    NSString *dirCopy = [dir copy];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
+      locale_t nvPrevLocale = uselocale(LC_C_LOCALE);
+      @try {
+        char dirc[PATH_MAX];
+        if ([dirCopy getFileSystemRepresentation:dirc maxLength:sizeof dirc]) nvmtl_aircache_trim_now(dirc);
+      } @catch (NSException *x) {
+        nvlog("aircache: trim ABANDONED - %s: %s", x.name.UTF8String ?: "?", x.reason.UTF8String ?: "?");
+      }
+      atomic_store(&gAirTrimRunning, 0);
+      uselocale(nvPrevLocale);
+    });
+}
+
 // The SPIR-V cache folder is chosen once, by creating it and writing to it. Sandboxed agents (iconservicesagent) could
 // not create the folder beside their AIR cache; every store failed with "folder doesn't exist" and every launch
 // translated its shaders again. The process's own temporary folder is always writable inside its sandbox.
 static BOOL nvmtl_dir_writable(NSString *d) {
-    if (!d || ![[NSFileManager defaultManager] createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:nil]) return NO;
+    if (!d) return NO;
+    const char *p = d.fileSystemRepresentation;
+    struct stat st;
+    if (stat(p, &st) == 0) {
+        if (!S_ISDIR(st.st_mode)) return NO;
+        // Short-circuit unwritable system/owner directories before attempting .probe-<pid> creation so sandboxed apps
+        // (App Store, Safari, etc.) do not trigger kernel sandbox deny spam on /Library/GPUBundles/nvmtl/aircache.
+        if (access(p, W_OK) != 0) return NO;
+    } else {
+        if (![[NSFileManager defaultManager] createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:nil]) return NO;
+    }
     NSString *probe = [d stringByAppendingPathComponent:[NSString stringWithFormat:@".probe-%d", getpid()]];
     const BOOL ok = [[NSData data] writeToFile:probe options:0 error:nil];
     if (ok) unlink(probe.fileSystemRepresentation);
@@ -508,6 +603,28 @@ static void nvmtl_spvcache_drop_stale(const char *dirc) {
     if (gone || failed)
         nvlog("spvcache: dropped %lu entries / %llu MiB left by earlier drivers (%lu of build %s kept, %lu could not be removed)",
               gone, freed >> 20, kept, gXlateBuildTag, failed);
+}
+static void nvmtl_aircache_drop_stale_idx(const char *dirc) {
+    if (!dirc || !strcmp(gXlateBuildTag, "untagged")) return;
+    DIR *eh = opendir(dirc);
+    if (!eh) return;
+    const size_t bn = strlen(gXlateBuildTag);
+    unsigned long gone = 0, kept = 0, failed = 0;
+    const struct dirent *de;
+    while ((de = readdir(eh)) != NULL) {
+        const size_t n = strlen(de->d_name);
+        if (n < 12 || strncmp(de->d_name, "idx2-", 5) != 0 || strcmp(de->d_name + n - 6, ".plist") != 0) continue;
+        BOOL same = NO;
+        for (const char *at = strstr(de->d_name, gXlateBuildTag); at; at = strstr(at + 1, gXlateBuildTag))
+            if (at > de->d_name && at[-1] == '.' && (at[bn] == '-' || at[bn] == '.')) { same = YES; break; }
+        if (same) { kept++; continue; }
+        char full[1200];
+        if (snprintf(full, sizeof full, "%s/%s", dirc, de->d_name) >= (int)sizeof full) continue;
+        if (unlink(full) == 0) gone++; else failed++;
+    }
+    closedir(eh);
+    if (gone || failed)
+        nvlog("aircache: dropped %lu stale idx2-*.plist entries (%lu of build %s kept, %lu failed)", gone, kept, gXlateBuildTag, failed);
 }
 static NSString *nvmtl_spvcache_dir(void) {
     static NSString *dir; static dispatch_once_t once;
@@ -566,9 +683,11 @@ static NSString *nvmtl_spvcache_path_digest(const unsigned char h[CC_SHA256_DIGE
     static dispatch_once_t sweepOnce;
     if (!getenv("NVMTL_SPVCACHE_KEEP_STALE")) dispatch_once(&sweepOnce, ^{
         NSString *chosen = d;
+        NSString *airDir = nvmtl_aircache_dir();
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
             char dirc[1024];
             if ([chosen getFileSystemRepresentation:dirc maxLength:sizeof dirc]) nvmtl_spvcache_drop_stale(dirc);
+            if (airDir && [airDir getFileSystemRepresentation:dirc maxLength:sizeof dirc]) nvmtl_aircache_drop_stale_idx(dirc);
         });
     });
     char hex[2 * CC_SHA256_DIGEST_LENGTH + 1];
@@ -668,7 +787,9 @@ static NSString *nvmtl_aircache_path(NSData *air) {
     CC_SHA256(air.bytes, (CC_LONG)air.length, h);
     char hex[2 * CC_SHA256_DIGEST_LENGTH + 1];
     for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) snprintf(hex + 2 * i, 3, "%02x", h[i]);
-    return [[nvmtl_aircache_dir() stringByAppendingPathComponent:@(hex)] stringByAppendingPathExtension:
+    NSString *d = nvmtl_aircache_dir();
+    nvmtl_aircache_trim_async(d);
+    return [[d stringByAppendingPathComponent:@(hex)] stringByAppendingPathExtension:
             getenv("NVMTL_CANONICAL_POINTERS") ? (nvmtl_air_unroll_wanted(air) ? @"p5.u2.ll" : @"p5.ll")
                                                : (nvmtl_air_unroll_wanted(air) ? @"u2.ll" : @"ll")];
 }
@@ -960,24 +1081,34 @@ static NSString *nvmtl_air_text_keep(NSString *name, NSString *s) {
     if (s.length >= 4096 && name && nvmtl_air_text_memo_on()) [nvmtl_air_text_memo() setObject:s forKey:name cost:s.length];
     return s;
 }
-static NSString *nvmtl_air_to_text_uncached(NSData *air, NSString *cache);
-static NSString *nvmtl_air_to_text(NSData *air) {
+static NSString *nvmtl_air_to_text_uncached(NSData *air, NSString *cache, BOOL persist);
+static NSString *nvmtl_air_to_text_opts(NSData *air, BOOL persist) {
     NSString *cache = nvmtl_aircache_path(air);
     NSString *kept = (cache && nvmtl_air_text_memo_on()) ? [nvmtl_air_text_memo() objectForKey:cache] : nil;
     if (kept) { gAirHit++; return kept; }
-    return nvmtl_air_text_keep(cache, nvmtl_air_to_text_uncached(air, cache));
+    return nvmtl_air_text_keep(cache, nvmtl_air_to_text_uncached(air, cache, persist));
 }
-static NSString *nvmtl_air_to_text_uncached(NSData *air, NSString *cache) {
+static NSString *nvmtl_air_to_text(NSData *air) { return nvmtl_air_to_text_opts(air, YES); }
+static NSString *nvmtl_air_to_text_uncached(NSData *air, NSString *cache, BOOL persist) {
     NSString *hit = [NSString stringWithContentsOfFile:cache encoding:NSUTF8StringEncoding error:nil];
-    if (hit.length) { gAirHit++; return nvmtl_air_text_made(hit); }
+    if (hit.length) { gAirHit++; nvmtl_cache_touch(cache); return nvmtl_air_text_made(hit); }
     NSString *twin = nvmtl_shared_twin(cache);
     hit = twin ? [NSString stringWithContentsOfFile:twin encoding:NSUTF8StringEncoding error:nil] : nil;
     if (hit.length) { gAirHit++; gSharedHit++; return nvmtl_air_text_made(hit); }
     gAirMiss++;
     NSString *memoryIR = nvmtl_air_in_memory(air);
     if (memoryIR.length) {
-        NSString *text = [memoryIR copy], *file = [cache copy];
-        nvmtl_cache_io(^{ if ([text writeToFile:file atomically:YES encoding:NSUTF8StringEncoding error:nil]) gAirStored++; });
+        if (persist) {
+            NSString *text = [memoryIR copy], *file = [cache copy], *airDir = [nvmtl_aircache_dir() copy];
+            const unsigned long long bytes = (unsigned long long)text.length;
+            nvmtl_cache_io(^{
+                if ([text writeToFile:file atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
+                    gAirStored++;
+                    atomic_fetch_add_explicit(&gAirAdded, bytes, memory_order_relaxed);
+                    nvmtl_aircache_trim_async(airDir);
+                }
+            });
+        }
         return nvmtl_air_text_made(memoryIR);
     }
 
@@ -994,12 +1125,19 @@ static NSString *nvmtl_air_to_text_uncached(NSData *air, NSString *cache) {
     }
     NSString *ll = [NSString stringWithContentsOfFile:outp encoding:NSUTF8StringEncoding error:nil];
     unlink(inp.UTF8String); unlink(outp.UTF8String);
-    if (ll.length) {
+    if (ll.length && persist) {
         NSError *mkerr = nil;
         [[NSFileManager defaultManager] createDirectoryAtPath:nvmtl_aircache_dir()
                                   withIntermediateDirectories:YES attributes:nil error:&mkerr];
-        NSString *text = [ll copy], *file = [cache copy];
-        nvmtl_cache_io(^{ if ([text writeToFile:file atomically:YES encoding:NSUTF8StringEncoding error:nil]) gAirStored++; });
+        NSString *text = [ll copy], *file = [cache copy], *airDir = [nvmtl_aircache_dir() copy];
+        const unsigned long long bytes = (unsigned long long)text.length;
+        nvmtl_cache_io(^{
+            if ([text writeToFile:file atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
+                gAirStored++;
+                atomic_fetch_add_explicit(&gAirAdded, bytes, memory_order_relaxed);
+                nvmtl_aircache_trim_async(airDir);
+            }
+        });
     }
     return nvmtl_air_text_made(ll);
 }
@@ -1352,17 +1490,27 @@ static void nvmtl_pre_run(void *ctx) {
     nvmtl_pre_job *j = ctx;
     @autoreleasepool {
         NVMTLLibrary *lib = CFBridgingRelease(j->lib); NSString *name = CFBridgingRelease(j->name); free(j);
-        NSData *air = lib->_fns[name]; NSString *ll = lib->_airs[name], *stage = lib->_stages[name];
-        if (!air || !ll || !stage.length || ![@[@"kernel", @"vertex", @"fragment"] containsObject:stage]
-            || (air.length >= 20 && *(const uint32_t *)air.bytes == 0x07230203u)
-            || (nvmtl_air_text_flags(ll) & (NVMTL_AIRF_DYLD_TABLE | NVMTL_AIRF_ISECT_TABLE))) atomic_fetch_add(&gPreSkipped, 1);
-        else {
+        NSData *air = lib->_fns[name]; NSString *stage = lib->_stages[name];
+        if (!air || !stage.length || ![@[@"kernel", @"vertex", @"fragment"] containsObject:stage]
+            || (air.length >= 20 && *(const uint32_t *)air.bytes == 0x07230203u)) {
+            atomic_fetch_add(&gPreSkipped, 1);
+        } else {
+            // Check spvcache (own + shared twin) BEFORE touching lib->_airs[name], so already-cached shaders never
+            // force NVMTLLazyAirs to read or disassemble .ll files.
             NSString *file = getenv("NVMTL_SPVCACHE_OFF") ? nil : nvmtl_spvcache_path(air, stage);
-            if (file && access(file.fileSystemRepresentation, F_OK) == 0) atomic_fetch_add(&gPreCached, 1);
-            else {
-                NSString *why = nil;
-                if (nvmtl_compile_library_entry(air, ll, stage, name, &why)) atomic_fetch_add(&gPreTranslated, 1);
-                else atomic_fetch_add(&gPreFailed, 1);   // a refusal the pipeline path may still handle (linking, constants)
+            NSString *twin = file ? nvmtl_shared_twin(file) : nil;
+            if ((file && access(file.fileSystemRepresentation, F_OK) == 0) ||
+                (twin && access(twin.fileSystemRepresentation, F_OK) == 0)) {
+                atomic_fetch_add(&gPreCached, 1);
+            } else {
+                NSString *ll = lib->_airs[name];
+                if (!ll || (nvmtl_air_text_flags(ll) & (NVMTL_AIRF_DYLD_TABLE | NVMTL_AIRF_ISECT_TABLE))) {
+                    atomic_fetch_add(&gPreSkipped, 1);
+                } else {
+                    NSString *why = nil;
+                    if (nvmtl_compile_library_entry(air, ll, stage, name, &why)) atomic_fetch_add(&gPreTranslated, 1);
+                    else atomic_fetch_add(&gPreFailed, 1);   // a refusal the pipeline path may still handle (linking, constants)
+                }
             }
         }
     }
@@ -1403,7 +1551,9 @@ NSDictionary<NSString *, NSData *> *nvmtl_index_metallib_uncached(NSData *lib, N
         if ((NSUInteger)off + size == 0 || i + off + size > n) continue;
         found++;
         NSData *air = [NSData dataWithBytes:b + i length:off + size];
-        NSString *ll = nvmtl_air_to_text(air);
+        // Decode in-memory only during metallib indexing so thousands of untouched system shaders are not eagerly
+        // persisted as .ll files in aircache; actively requested functions still decode/cache on demand.
+        NSString *ll = nvmtl_air_to_text_opts(air, NO);
         if (!ll) continue;
         NSString *name = nil, *stage = nil;
         if (!nvmtl_entry_of(ll, &name, &stage)) {

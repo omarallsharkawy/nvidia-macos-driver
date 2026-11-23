@@ -466,6 +466,7 @@ typedef struct {
 } nvmtl_vk_dlss_args;
 int nvmtl_vk_dlss_available(void);
 int nvmtl_vk_cmd_dlss(nvk_cmdbuf *c, void **feature, const nvmtl_vk_dlss_args *a);
+void nvmtl_vk_dlss_destroy(void *feature);
 // DLSS Ray Reconstruction behind the MetalFX temporal denoised scaler. rr_available: nvmtl_vk_dlss_available and the core
 // reported Ray Reconstruction. cmd_dlss_rr records one denoise + upscale; *feature works as for cmd_dlss.
 typedef struct {
@@ -479,6 +480,7 @@ typedef struct {
 } nvmtl_vk_dlss_rr_args;
 int nvmtl_vk_dlss_rr_available(void);
 int nvmtl_vk_cmd_dlss_rr(nvk_cmdbuf *c, void **feature, const nvmtl_vk_dlss_rr_args *a);
+void nvmtl_vk_dlss_rr_destroy(void *feature);
 // DLSS Frame Generation behind the MetalFX frame interpolator: one evaluation writes the in-between frame into output.
 typedef struct {
     nvk_image *color, *depth, *motion, *output, *ui;   // ui may be NULL
@@ -493,6 +495,7 @@ typedef struct {
 } nvmtl_vk_dlss_fg_args;
 int nvmtl_vk_dlss_fg_available(void);
 int nvmtl_vk_cmd_dlss_fg(nvk_cmdbuf *c, void **feature, const nvmtl_vk_dlss_fg_args *a);
+void nvmtl_vk_dlss_fg_destroy(void *feature);
 int nvmtl_vk_cmd_blit_convert(nvk_cmdbuf *c, nvk_image *src, uint32_t sl, uint32_t ss, uint32_t sx, uint32_t sy,
                               nvk_image *dst, uint32_t dl, uint32_t ds, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h);
 void nvmtl_vk_buffer_destroy(nvk_buffer *b);

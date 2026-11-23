@@ -29,8 +29,9 @@ static inline int nvmtl_ic_acquire(nvmtl_ic *c, uint32_t sid, size_t need, uint6
 {
     for (int i = 0; i < NVMTL_IC_SLOTS; i++) {
         nvmtl_ic_slot *e = &c->s[i];
-        if (!e->id || e->sid != sid || e->need != need || e->stale) continue;
+        if (!e->id || e->sid != sid || e->stale) continue;
         if (e->cookie != cookie) { e->stale = 1; continue; }
+        if (e->need != need) continue;
         e->refs++; memcpy(payload, e->payload, n < NVMTL_IC_PAYLOAD ? n : NVMTL_IC_PAYLOAD);
         return 1;
     }

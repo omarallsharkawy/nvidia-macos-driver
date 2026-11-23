@@ -141,11 +141,15 @@ static NVMTLTexture *nvmtl_dlss_tex(id<MTLTexture> t) { return [(id)t isKindOfCl
     int rc;
     @synchronized (self) { rc = nvmtl_vk_cmd_dlss(&cb->_c, &_feature, &a); }
     if (rc) { nvlog("dlss: upscale was not recorded (output left as it was)"); return; }
+    nvmtl_retain_resource(cb, self);
     nvmtl_retain_resource(cb, color); nvmtl_retain_resource(cb, depth); nvmtl_retain_resource(cb, motion); nvmtl_retain_resource(cb, out);
     if (expo && !_autoExposure) nvmtl_retain_resource(cb, expo);
     if (react) nvmtl_retain_resource(cb, react);
     NVMTLTexture *rs = out->_parent ? out->_parent : out;
     if (rs->_surf) nvmtl_surf_dirty(cb, rs);
+}
+- (void)dealloc {
+    if (_feature) { nvmtl_vk_dlss_destroy(_feature); _feature = NULL; }
 }
 @end
 
@@ -291,6 +295,7 @@ static void nvmtl_rr_matrix(float out[16], simd_float4x4 m) {
     int rc;
     @synchronized (self) { rc = nvmtl_vk_cmd_dlss_rr(&cb->_c, &_feature, &a); }
     if (rc) { nvlog("dlss: RR: denoise was not recorded (output left as it was)"); return; }
+    nvmtl_retain_resource(cb, self);
     NVMTLTexture *all[] = { color, depth, motion, out, diff, spec, nrm, rgh };
     for (size_t k = 0; k < sizeof all / sizeof all[0]; k++) nvmtl_retain_resource(cb, all[k]);
     if (hit) nvmtl_retain_resource(cb, hit);
@@ -298,6 +303,9 @@ static void nvmtl_rr_matrix(float out[16], simd_float4x4 m) {
     if (react) nvmtl_retain_resource(cb, react);
     NVMTLTexture *rs = out->_parent ? out->_parent : out;
     if (rs->_surf) nvmtl_surf_dirty(cb, rs);
+}
+- (void)dealloc {
+    if (_feature) { nvmtl_vk_dlss_rr_destroy(_feature); _feature = NULL; }
 }
 @end
 
@@ -482,10 +490,14 @@ static void nvmtl_fg_copy(float out[16], simd_float4x4 m) { for (int c = 0; c < 
     if (!rc) rc = [self evaluate:cb args:a color:color reset:reset];
     if (rc) { nvlog("dlss: FG: interpolation was not recorded (output left as it was)"); _haveHistory = NO; return; }
     _haveHistory = YES; _lastColor = _colorTexture; if (haveMat) { _prevVP = vp; _havePrevVP = YES; }
+    nvmtl_retain_resource(cb, self);
     nvmtl_retain_resource(cb, color); nvmtl_retain_resource(cb, depth); nvmtl_retain_resource(cb, motion); nvmtl_retain_resource(cb, out);
     if (ui) nvmtl_retain_resource(cb, ui);
     NVMTLTexture *rs = out->_parent ? out->_parent : out;
     if (rs->_surf) nvmtl_surf_dirty(cb, rs);
+}
+- (void)dealloc {
+    if (_feature) { nvmtl_vk_dlss_fg_destroy(_feature); _feature = NULL; }
 }
 @end
 

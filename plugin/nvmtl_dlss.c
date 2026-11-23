@@ -84,15 +84,18 @@ typedef struct { void **vt; } ngxp;   /* parameter object; vtable: 0 SetULL 1 Se
 typedef unsigned (*alloc_fn)(ngxp **);
 typedef unsigned (*create_fn)(void *dev, void *cmd, int node, ngxp *params, void **handle);
 typedef unsigned (*eval_fn)(void *cmd, void *handle, ngxp *params, void *cb);
+typedef unsigned (*release_fn)(void *handle);
+typedef unsigned (*destroy_params_fn)(ngxp *params);
 static alloc_fn g_alloc; static create_fn g_create; static eval_fn g_eval;
+static release_fn g_release; static destroy_params_fn g_destroy_params;
 
 /* NVSDK_NGX_Resource_VK: view, image, subresource range, format, size, then type (0 = image view) and read-write. */
 typedef struct { VkImageView view; VkImage image; VkImageSubresourceRange range; VkFormat format; unsigned w, h; } ngx_image_vk;
 typedef struct { ngx_image_vk image; int type; bool rw; } ngx_res_vk;
 
-struct nvmtl_dlss_feature { void *handle; ngxp *eval; nvmtl_dlss_cfg cfg; };
-struct nvmtl_dlss_fg_feature { void *handle; ngxp *eval; nvmtl_dlss_fg_cfg cfg; float clip_to_prev[16], prev_to_clip[16], view_to_clip[16]; };
-struct nvmtl_dlss_rr_feature { void *handle; ngxp *eval; nvmtl_dlss_rr_cfg cfg; float world_to_view[16], view_to_clip[16]; };
+struct nvmtl_dlss_feature { void *handle; ngxp *eval; ngxp *create_prm; nvmtl_dlss_cfg cfg; };
+struct nvmtl_dlss_fg_feature { void *handle; ngxp *eval; ngxp *create_prm; nvmtl_dlss_fg_cfg cfg; float clip_to_prev[16], prev_to_clip[16], view_to_clip[16]; };
+struct nvmtl_dlss_rr_feature { void *handle; ngxp *eval; ngxp *create_prm; nvmtl_dlss_rr_cfg cfg; float world_to_view[16], view_to_clip[16]; };
 
 /* ---- the files ---------------------------------------------------------------------------------------------- */
 static int is_dir(const char *p) { struct stat s; return stat(p, &s) == 0 && S_ISDIR(s.st_mode); }
@@ -341,6 +344,8 @@ static int init_locked(VkInstance inst, VkPhysicalDevice pd, VkDevice dev, PFN_v
     g_alloc = elfhost_sym(g_core, "NVSDK_NGX_VULKAN_AllocateParameters");
     g_create = elfhost_sym(g_core, "NVSDK_NGX_VULKAN_CreateFeature1");
     g_eval = elfhost_sym(g_core, "NVSDK_NGX_VULKAN_EvaluateFeature");
+    g_release = elfhost_sym(g_core, "NVSDK_NGX_VULKAN_ReleaseFeature");
+    g_destroy_params = elfhost_sym(g_core, "NVSDK_NGX_VULKAN_DestroyParameters");
     if (!init2 || !caps_fn || !g_alloc || !g_create || !g_eval) return fail("NGX core lacks an expected entry point");
     static wchar_t wpath[1024]; mbstowcs(wpath, NVMTL_DLSS_SNIPPET_DIR, 1023); static const wchar_t *paths[1] = { wpath };
     struct { const wchar_t *const *p; unsigned n; void *in; void (*cb)(const char *, int, int); int lvl; bool off; } info = { paths, 1, NULL, ngx_log, 1, 0 };
@@ -423,15 +428,18 @@ static nvmtl_dlss_feature *create_impl(VkCommandBuffer cmd, const nvmtl_dlss_cfg
     if (rc != 1 || !handle) { nvlog("dlss: CreateFeature1 returned 0x%08x", rc); goto bad; }
     g_alloc(&ev);
     if (!ev) { nvlog("dlss: AllocateParameters (evaluate) gave nothing"); goto bad; }
-    f->handle = handle; f->eval = ev; f->cfg = *cfg;
+    f->handle = handle; f->eval = ev; f->create_prm = prm; f->cfg = *cfg;
     pthread_mutex_unlock(&g_lock);
     nvlog("dlss: feature %ux%u -> %ux%u, quality %d, hdr %d, mv %s%s, depth %s, exposure %s", cfg->in_w, cfg->in_h, cfg->out_w, cfg->out_h,
           quality, cfg->hdr, cfg->mv_lowres ? "input-res" : "output-res", cfg->mv_jittered ? "+jitter" : "",
           cfg->depth_inverted ? "inverted" : "normal", cfg->auto_exposure ? "auto" : "texture");
     return f;
 bad:
+    if (handle && g_release) g_release(handle);
+    if (ev && g_destroy_params) g_destroy_params(ev);
+    if (prm && g_destroy_params) g_destroy_params(prm);
     pthread_mutex_unlock(&g_lock);
-    free(f);   /* the parameter objects and any half-made feature belong to the core and are not released here */
+    free(f);
     return NULL;
 }
 const nvmtl_dlss_cfg *nvmtl_dlss_feature_cfg(const nvmtl_dlss_feature *f) { return &f->cfg; }
@@ -513,12 +521,15 @@ static nvmtl_dlss_rr_feature *rr_create_impl(VkCommandBuffer cmd, const nvmtl_dl
     if (rc != 1 || !handle) { nvlog("dlss: RR CreateFeature1 returned 0x%08x (feature id %d)", rc, rr_feature_id()); goto bad; }
     g_alloc(&ev);
     if (!ev) { nvlog("dlss: RR AllocateParameters (evaluate) gave nothing"); goto bad; }
-    f->handle = handle; f->eval = ev; f->cfg = *cfg;
+    f->handle = handle; f->eval = ev; f->create_prm = prm; f->cfg = *cfg;
     pthread_mutex_unlock(&g_lock);
     nvlog("dlss: RR feature %ux%u -> %ux%u, quality %d, hdr %d, depth %s, exposure %s", cfg->in_w, cfg->in_h, cfg->out_w, cfg->out_h,
           quality, cfg->hdr, cfg->depth_inverted ? "inverted" : "normal", cfg->auto_exposure ? "auto" : "texture");
     return f;
 bad:
+    if (handle && g_release) g_release(handle);
+    if (ev && g_destroy_params) g_destroy_params(ev);
+    if (prm && g_destroy_params) g_destroy_params(prm);
     pthread_mutex_unlock(&g_lock);
     free(f);
     return NULL;
@@ -593,12 +604,15 @@ static nvmtl_dlss_fg_feature *fg_create_impl(VkCommandBuffer cmd, const nvmtl_dl
     }
     g_alloc(&ev);
     if (!ev) { nvlog("dlss: FG AllocateParameters (evaluate) gave nothing"); goto bad; }
-    f->handle = handle; f->eval = ev; f->cfg = *cfg;
+    f->handle = handle; f->eval = ev; f->create_prm = prm; f->cfg = *cfg;
     pthread_mutex_unlock(&g_lock);
     nvlog("dlss: FG feature %ux%u (depth/motion %ux%u), format %u, hdr %d, depth %s", cfg->out_w, cfg->out_h, cfg->in_w, cfg->in_h,
           cfg->color_format, cfg->hdr, cfg->depth_inverted ? "inverted" : "normal");
     return f;
 bad:
+    if (handle && g_release) g_release(handle);
+    if (ev && g_destroy_params) g_destroy_params(ev);
+    if (prm && g_destroy_params) g_destroy_params(prm);
     pthread_mutex_unlock(&g_lock);
     free(f);
     return NULL;
@@ -754,6 +768,41 @@ int nvmtl_dlss_fg_evaluate(VkCommandBuffer cmd, nvmtl_dlss_fg_feature *f, const 
     fg_eval_job j = { cmd, f, e, -1 };
     if (run_on_worker(fg_eval_run, &j)) return -1;
     return j.r;
+}
+typedef struct { void *handle; ngxp *eval; ngxp *create_prm; const char *tag; } release_job;
+static void release_run(void *a)
+{
+    release_job *j = a;
+    if (g_state != 1) return;
+    pthread_mutex_lock(&g_lock);
+    if (j->handle && g_release) {
+        const unsigned rc = g_release(j->handle);
+        if (rc != 1) nvlog("dlss: %s ReleaseFeature returned 0x%08x", j->tag, rc);
+    }
+    if (j->eval && g_destroy_params) g_destroy_params(j->eval);
+    if (j->create_prm && g_destroy_params) g_destroy_params(j->create_prm);
+    pthread_mutex_unlock(&g_lock);
+}
+void nvmtl_dlss_feature_destroy(nvmtl_dlss_feature *f)
+{
+    if (!f) return;
+    release_job j = { f->handle, f->eval, f->create_prm, "SR" };
+    if (g_state == 1) (void)run_on_worker(release_run, &j);
+    free(f);
+}
+void nvmtl_dlss_rr_feature_destroy(nvmtl_dlss_rr_feature *f)
+{
+    if (!f) return;
+    release_job j = { f->handle, f->eval, f->create_prm, "RR" };
+    if (g_state == 1) (void)run_on_worker(release_run, &j);
+    free(f);
+}
+void nvmtl_dlss_fg_feature_destroy(nvmtl_dlss_fg_feature *f)
+{
+    if (!f) return;
+    release_job j = { f->handle, f->eval, f->create_prm, "FG" };
+    if (g_state == 1) (void)run_on_worker(release_run, &j);
+    free(f);
 }
 static size_t probe_depth(size_t used, size_t limit)
 {

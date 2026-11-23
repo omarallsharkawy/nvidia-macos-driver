@@ -323,6 +323,7 @@ static void nvmtl_vw_tic_note(const void *view);   /* the view's descriptor indi
 static void nvmtl_tabshadow_tick(void);              /* the GPU-side shadow of NVK's image table, every few submits and at every table growth */
 static void nvmtl_vw_note_died(const void *view);
 static void nvmtl_buffer_grace_reap(void);
+static void nvmtl_dlss_grace_reap(void);
 static void nvmtl_fx_note_buffer_gone(nvk_buffer *b, uint32_t where);
 static __thread const char *t_fx_dying;   // the label the next image death on this thread is recorded under
 void nvmtl_vk_image_dying_label(const char *label) { t_fx_dying = label; }
@@ -7339,12 +7340,14 @@ static long double nvmtl_tick_delta(uint64_t value, uint64_t anchor, unsigned bi
 void nvmtl_vk_clock_refresh(void)
 {
     if (g_state != 1 || !pvkGetCalibratedTimestampsEXT || !g_timestamp_bits) return;
+    static uint64_t g_gpu_clock_last_try;
     pthread_mutex_lock(&g_gpu_clock_lock);
     uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    if (g_gpu_clock.valid && now >= g_gpu_clock.uptime_ns &&
-        now - g_gpu_clock.uptime_ns < 1000000000ull) {
+    if ((g_gpu_clock.valid && now >= g_gpu_clock.uptime_ns && now - g_gpu_clock.uptime_ns < 1000000000ull) ||
+        (!g_gpu_clock.valid && g_gpu_clock_last_try && now >= g_gpu_clock_last_try && now - g_gpu_clock_last_try < 2000000000ull)) {
         pthread_mutex_unlock(&g_gpu_clock_lock); return;
     }
+    g_gpu_clock_last_try = now;
     nvmtl_gpu_clock best = {0}, previous = {0};
     unsigned advancing = 0;
     VkCalibratedTimestampInfoEXT info = { VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT, NULL, VK_TIME_DOMAIN_DEVICE_EXT };
@@ -8674,7 +8677,7 @@ int nvmtl_vk_submit_finish(nvmtl_inflight *f)
             uint64_t prev = __atomic_load_n(&g_cmd_finished_seq, __ATOMIC_ACQUIRE);
             while (c->fx_seq > prev && !__atomic_compare_exchange_n(&g_cmd_finished_seq, &prev, c->fx_seq, 1, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {}
         }
-        nvmtl_page_cool_reap(); nvmtl_buffer_grace_reap(); nvmtl_slot_drop_reap();
+        nvmtl_page_cool_reap(); nvmtl_buffer_grace_reap(); nvmtl_dlss_grace_reap(); nvmtl_slot_drop_reap();
         nvmtl_tabshadow_tick();
     }
     if (c->wseq && c->wseq != NVMTL_WSEQ_BLIND) {
@@ -11285,41 +11288,49 @@ static int pool_block_take(pool_block *blk, size_t len, size_t *off)
 }
 static void pool_block_give(pool_block *blk, size_t off, size_t len)
 {
-    if (off + len == blk->used) { blk->used = off; }
-    else {
-        for (uint32_t i = 0; i < blk->nfr; i++) {
-            if (blk->fr[i].off + blk->fr[i].len == off) { blk->fr[i].len += len; return; }
-            if (off + len == blk->fr[i].off) { blk->fr[i].off = off; blk->fr[i].len += len; return; }
+    if (!blk->nlive) { blk->used = 0; blk->nfr = 0; return; }
+    /* Full 3-way coalescing with adjacent free ranges and tail-trim against blk->used. */
+    size_t lo = off, hi = off + len;
+    int merged = 1;
+    while (merged) {
+        merged = 0;
+        for (uint32_t i = 0; i < blk->nfr; ) {
+            const size_t flo = blk->fr[i].off, fhi = flo + blk->fr[i].len;
+            if (fhi == lo) { lo = flo; blk->fr[i] = blk->fr[--blk->nfr]; merged = 1; }
+            else if (hi == flo) { hi = fhi; blk->fr[i] = blk->fr[--blk->nfr]; merged = 1; }
+            else i++;
         }
-        if (blk->nfr == blk->cfr) { uint32_t c = blk->cfr ? blk->cfr * 2 : 64; pool_range *n = realloc(blk->fr, c * sizeof *n); if (!n) return; blk->fr = n; blk->cfr = c; }
-        blk->fr[blk->nfr].off = off; blk->fr[blk->nfr].len = len; blk->nfr++;
     }
-    if (!blk->nlive) { blk->used = 0; blk->nfr = 0; }
+    if (hi == blk->used) { blk->used = lo; return; }
+    if (blk->nfr == blk->cfr) { uint32_t c = blk->cfr ? blk->cfr * 2 : 64; pool_range *n = realloc(blk->fr, c * sizeof *n); if (!n) return; blk->fr = n; blk->cfr = c; }
+    blk->fr[blk->nfr].off = lo; blk->fr[blk->nfr].len = hi - lo; blk->nfr++;
 }
 static int vpool_on(void)
 {
     static int on = -1;
     if (on < 0) { const char *e = getenv("NVMTL_SHARED_POOL_VRAM"); on = !(e && e[0] == '0');
         if (!on) nvlog("vk: small Shared buffers stay in the system-RAM pool (NVMTL_SHARED_POOL_VRAM=0)"); }
-    return on && bar1_on() && !g_bar1_off;
+    return on && bar1_on() && !__atomic_load_n(&g_bar1_off, __ATOMIC_ACQUIRE);
 }
 static const char *pool_place_why(int vram)
 {
     if (vram) return "VRAM through BAR1";
     if (!bar1_on()) return "system RAM BY DESIGN - Shared is system RAM on a discrete GPU (batch 56; NVMTL_SHARED_VRAM=1 opts in)";
-    if (g_bar1_off) return "system RAM - BAR1 REFUSED a VRAM block for this process (see the REFUSED line above)";
+    if (__atomic_load_n(&g_bar1_off, __ATOMIC_ACQUIRE)) return "system RAM - BAR1 REFUSED a VRAM block for this process (see the REFUSED line above)";
     return "system RAM - this request never asked for VRAM (host_visible != 2)";
 }
 static int vpool_heap_create(size_t size, nvk_heap *out)
 {
-    static uint32_t bits;
+    static _Atomic uint32_t bits_cached;
     memset(out, 0, sizeof *out);
+    uint32_t bits = atomic_load_explicit(&bits_cached, memory_order_acquire);
     if (!bits) {
         VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, 4096, NVMTL_BUFFER_USAGE, VK_SHARING_MODE_EXCLUSIVE, 0, NULL };
         VkBuffer pb = VK_NULL_HANDLE;
         if (pvkCreateBuffer(g_dev, &bci, NULL, &pb) != VK_SUCCESS) return -1;
         VkMemoryRequirements mr; pvkGetBufferMemoryRequirements(g_dev, pb, &mr); pvkDestroyBuffer(g_dev, pb, NULL);
         bits = mr.memoryTypeBits; if (!bits) return -1;
+        atomic_store_explicit(&bits_cached, bits, memory_order_release);
     }
     int bt = bar1_memtype(bits, size); if (bt < 0) return -1;
     VkMemoryAllocateFlagsInfo bf = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, NULL, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0 };
@@ -11330,11 +11341,13 @@ static int vpool_heap_create(size_t size, nvk_heap *out)
     if (r2 != VK_SUCCESS || !bp) {
         if (r1 == VK_SUCCESS && r2 == VK_SUCCESS) pvkUnmapMemory(g_dev, bm);
         if (bm) pvkFreeMemory(g_dev, bm, NULL);
-        g_bar1_off = 1;
-        nvlog("buffer pool: VRAM block REFUSED (alloc %d, map %d) at %zu BAR bytes - small Shared buffers take system RAM for this process", r1, r2, g_bar1_bytes);
+        __atomic_store_n(&g_bar1_off, 1, __ATOMIC_RELEASE);
+        nvlog("buffer pool: VRAM block REFUSED (alloc %d, map %d) at %zu BAR bytes - small Shared buffers take system RAM for this process",
+              r1, r2, __atomic_load_n(&g_bar1_bytes, __ATOMIC_RELAXED));
         return -1; }
     out->mem = bm; out->map = bp; out->size = size; out->memtype = (uint32_t)bt; out->host_visible = 1;
-    g_alloc_bytes += size; g_bar1_bytes += size;
+    __atomic_fetch_add(&g_alloc_bytes, size, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_bar1_bytes, size, __ATOMIC_RELAXED);
     return 0;
 }
 static int pool_buffer_create_in(int vram, size_t size, nvk_buffer *out)
@@ -11345,14 +11358,24 @@ static int pool_buffer_create_in(int vram, size_t size, nvk_buffer *out)
     pool_block *blk = *head; size_t off = 0; int got = 0;
     for (; blk; blk = blk->next) if (pool_block_take(blk, len, &off)) { got = 1; break; }
     if (!got) {
+        pthread_mutex_unlock(&g_pool_lock);
         pool_block *nb = calloc(1, sizeof *nb);
-        if (!nb || (vram ? vpool_heap_create(NVMTL_VPOOL_BLOCK, &nb->heap) : nvmtl_vk_heap_create(NVMTL_POOL_BLOCK, 1, &nb->heap))) { free(nb); pthread_mutex_unlock(&g_pool_lock); return -1; }
+        if (!nb || (vram ? vpool_heap_create(NVMTL_VPOOL_BLOCK, &nb->heap) : nvmtl_vk_heap_create(NVMTL_POOL_BLOCK, 1, &nb->heap))) { free(nb); return -1; }
+        /* Zero the 32 MiB host-mapped block outside g_pool_lock so concurrent pool allocs/frees never stall on memset/page-faults. */
+        nvmtl_vk_heap_zero(&nb->heap, vram ? "buffer pool (VRAM through BAR1)" : "buffer pool");
+        pthread_mutex_lock(&g_pool_lock);
+        if (!pool_block_take(nb, len, &off)) {
+            pthread_mutex_unlock(&g_pool_lock);
+            const size_t hs = nb->heap.size;
+            nvmtl_vk_heap_destroy(&nb->heap); free(nb);
+            if (vram) __atomic_fetch_sub(&g_bar1_bytes, hs, __ATOMIC_RELAXED);
+            return -1;
+        }
         nb->vram = vram; nb->next = *head; *head = nb; g_pool_blocks++; if (vram) g_vpool_blocks++;
-        nvmtl_vk_heap_zero(&nb->heap, vram ? "buffer pool (VRAM through BAR1)" : "buffer pool");   // mapped: a host memset, no submit under the pool lock
         nvlog("buffer pool: block #%llu mapped (%zu MiB, %s; %llu VRAM blocks, memory type %u); %llu pooled buffers live in %llu bytes of ranges",
               (unsigned long long)g_pool_blocks, nb->heap.size >> 20, pool_place_why(vram), (unsigned long long)g_vpool_blocks,
               nb->heap.memtype, (unsigned long long)g_pool_live, (unsigned long long)g_pool_bytes);
-        blk = nb; if (!pool_block_take(blk, len, &off)) { pthread_mutex_unlock(&g_pool_lock); return -1; }
+        blk = nb;
     }
     blk->nlive++; g_pool_live++; g_pool_bytes += len;
     pthread_mutex_unlock(&g_pool_lock);
@@ -11382,7 +11405,7 @@ static void pool_buffer_release(nvk_buffer *b)
             pool_block **pp = head; while (*pp && *pp != blk) pp = &(*pp)->next;
             if (*pp) { *pp = blk->next; const size_t hs = blk->heap.size; const int v = blk->vram;
                 nvmtl_vk_heap_destroy(&blk->heap); free(blk->fr); free(blk); g_pool_blocks--;
-                if (v == 1) { g_vpool_blocks--; g_bar1_bytes -= hs; } }
+                if (v == 1) { g_vpool_blocks--; __atomic_fetch_sub(&g_bar1_bytes, hs, __ATOMIC_RELAXED); } }
         }
     }
     pthread_mutex_unlock(&g_pool_lock);
@@ -11414,18 +11437,24 @@ static pool_block *pool_take_vram(int vram, uint32_t bits, size_t reserved, size
     pool_block *blk = *pool_head(vram); int got = 0;
     for (; blk; blk = blk->next) if ((bits & (1u << blk->heap.memtype)) && pool_block_take(blk, reserved, off)) { got = 1; break; }
     if (!got) {
+        pthread_mutex_unlock(&g_pool_lock);
         pool_block *fresh = calloc(1, sizeof *fresh);
-        if (!fresh || nvmtl_vk_heap_create(NVMTL_POOL_BLOCK, 0, &fresh->heap)) { free(fresh); pthread_mutex_unlock(&g_pool_lock); return NULL; }
-        if (!(bits & (1u << fresh->heap.memtype)) || !pool_block_take(fresh, reserved, off)) {
-            nvmtl_vk_heap_destroy(&fresh->heap); free(fresh); pthread_mutex_unlock(&g_pool_lock); return NULL; }
+        if (!fresh || nvmtl_vk_heap_create(NVMTL_POOL_BLOCK, 0, &fresh->heap)) { free(fresh); return NULL; }
+        if (!(bits & (1u << fresh->heap.memtype)) || reserved > fresh->heap.size) {
+            nvmtl_vk_heap_destroy(&fresh->heap); free(fresh); return NULL; }
+        /* Zero the fresh VRAM block BEFORE listing it in *pool_head(vram) (and outside g_pool_lock):
+           previously it was listed first, so another thread could sub-allocate, write, and submit before
+           this thread's vkCmdFillBuffer(0) ran, zeroing live VRAM. */
+        nvmtl_vk_heap_zero(&fresh->heap, what);
+        pthread_mutex_lock(&g_pool_lock);
+        if (!pool_block_take(fresh, reserved, off)) {
+            pthread_mutex_unlock(&g_pool_lock);
+            nvmtl_vk_heap_destroy(&fresh->heap); free(fresh); return NULL; }
         fresh->vram = vram; fresh->next = *pool_head(vram); *pool_head(vram) = fresh; g_pool_blocks++; blk = fresh;
         nvlog("%s pool: %zu MiB block, memory type %u, %llu pool blocks in all", what, fresh->heap.size >> 20, fresh->heap.memtype, (unsigned long long)g_pool_blocks);
     }
     blk->nlive++; g_pool_live++; g_pool_bytes += reserved;
     pthread_mutex_unlock(&g_pool_lock);
-    // A fresh VRAM block is cleared outside the pool lock (the clear submits and waits, and a submit's retire can take
-    // that lock). The block is already listed, but every use of a range in it is a later submit on the in-order queue.
-    if (!got) nvmtl_vk_heap_zero(&blk->heap, what);
     return blk;
 }
 static int private_pool_buffer_create(size_t size, nvk_buffer *out)
@@ -11821,6 +11850,53 @@ static void dlss_describe(const char *what, const nvk_image *i)
     if (i) nvlog("dlss: %-8s VkFormat %u %ux%u mips %u layers %u type %u samples %u usage 0x%x storage %u aspect 0x%x",
                  what, i->fmt, i->w, i->h, i->mips, i->layers, i->mtl_type, i->samples, i->usage, i->storage, nvmtl_barrier_aspect(i));
 }
+typedef struct nvmtl_dlss_grace { int kind; void *feature; nvmtl_pl_node life; } nvmtl_dlss_grace;
+static nvmtl_pl_state g_dlss_bg; static pthread_mutex_t g_dlss_bg_lock = PTHREAD_MUTEX_INITIALIZER;
+static void nvmtl_dlss_destroy_now(int kind, void *feature)
+{
+    if (!feature) return;
+    if (kind == 0) nvmtl_dlss_feature_destroy((nvmtl_dlss_feature *)feature);
+    else if (kind == 1) nvmtl_dlss_rr_feature_destroy((nvmtl_dlss_rr_feature *)feature);
+    else nvmtl_dlss_fg_feature_destroy((nvmtl_dlss_fg_feature *)feature);
+}
+static void nvmtl_dlss_grace_reap(void)
+{
+    nvmtl_pl_node *due = NULL;
+    pthread_mutex_lock(&g_dlss_bg_lock);
+    (void)nvmtl_pl_reap(&g_dlss_bg, __atomic_load_n(&g_cmd_finished_seq, __ATOMIC_ACQUIRE), &due);
+    pthread_mutex_unlock(&g_dlss_bg_lock);
+    while (due) {
+        nvmtl_pl_node *e = due; due = e->cool;
+        nvmtl_dlss_grace *g = (nvmtl_dlss_grace *)((char *)e - offsetof(nvmtl_dlss_grace, life));
+        nvmtl_dlss_destroy_now(g->kind, g->feature);
+        free(g);
+    }
+}
+static void nvmtl_dlss_enqueue_destroy(int kind, void *feature, uint64_t stamp)
+{
+    if (!feature) return;
+    nvmtl_dlss_grace *g = calloc(1, sizeof *g);
+    if (!g) { nvmtl_dlss_destroy_now(kind, feature); return; }
+    g->kind = kind; g->feature = feature;
+    nvmtl_pl_stamp(&g->life, stamp);
+    pthread_mutex_lock(&g_dlss_bg_lock);
+    nvmtl_pl_made(&g_dlss_bg);
+    const int now = nvmtl_pl_release(&g_dlss_bg, &g->life, __atomic_load_n(&g_cmd_finished_seq, __ATOMIC_ACQUIRE), 0);
+    pthread_mutex_unlock(&g_dlss_bg_lock);
+    if (now) { nvmtl_dlss_destroy_now(g->kind, g->feature); free(g); }
+}
+void nvmtl_vk_dlss_destroy(void *feature)
+{
+    nvmtl_dlss_enqueue_destroy(0, feature, atomic_load_explicit(&g_cmd_submitted, memory_order_acquire));
+}
+void nvmtl_vk_dlss_rr_destroy(void *feature)
+{
+    nvmtl_dlss_enqueue_destroy(1, feature, atomic_load_explicit(&g_cmd_submitted, memory_order_acquire));
+}
+void nvmtl_vk_dlss_fg_destroy(void *feature)
+{
+    nvmtl_dlss_enqueue_destroy(2, feature, atomic_load_explicit(&g_cmd_submitted, memory_order_acquire));
+}
 int nvmtl_vk_cmd_dlss(nvk_cmdbuf *c, void **feature, const nvmtl_vk_dlss_args *a)
 {
     if (!c || !feature || !a || !nvmtl_dlss_ready()) return -1;
@@ -11861,8 +11937,9 @@ int nvmtl_vk_cmd_dlss(nvk_cmdbuf *c, void **feature, const nvmtl_vk_dlss_args *a
                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
     nvmtl_dlss_feature *f = (nvmtl_dlss_feature *)*feature;
     if (f && memcmp(nvmtl_dlss_feature_cfg(f), &want, sizeof want)) {
-        nvlog("dlss: scaler settings changed - making a new feature (the old one is kept until the process ends)");
-        f = NULL;
+        nvlog("dlss: scaler settings changed - retiring old feature and making a new one");
+        nvmtl_dlss_enqueue_destroy(0, f, atomic_load_explicit(&g_cmd_submitted, memory_order_acquire) + 1);
+        *feature = NULL; f = NULL;
     }
     if (!f) {
         f = nvmtl_dlss_feature_create(c->cb, &want); if (!f) return -1; *feature = f;
@@ -11919,8 +11996,9 @@ int nvmtl_vk_cmd_dlss_rr(nvk_cmdbuf *c, void **feature, const nvmtl_vk_dlss_rr_a
                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
     nvmtl_dlss_rr_feature *f = (nvmtl_dlss_rr_feature *)*feature;
     if (f && memcmp(nvmtl_dlss_rr_feature_cfg(f), &want, sizeof want)) {
-        nvlog("dlss: denoised scaler settings changed - making a new RR feature (the old one is kept until the process ends)");
-        f = NULL;
+        nvlog("dlss: denoised scaler settings changed - retiring old RR feature and making a new one");
+        nvmtl_dlss_enqueue_destroy(1, f, atomic_load_explicit(&g_cmd_submitted, memory_order_acquire) + 1);
+        *feature = NULL; f = NULL;
     }
     if (!f) {
         f = nvmtl_dlss_rr_feature_create(c->cb, &want); if (!f) return -1; *feature = f;
@@ -11970,8 +12048,9 @@ int nvmtl_vk_cmd_dlss_fg(nvk_cmdbuf *c, void **feature, const nvmtl_vk_dlss_fg_a
                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
     nvmtl_dlss_fg_feature *f = (nvmtl_dlss_fg_feature *)*feature;
     if (f && memcmp(nvmtl_dlss_fg_feature_cfg(f), &want, sizeof want)) {
-        nvlog("dlss: frame interpolator settings changed - making a new FG feature (the old one is kept until the process ends)");
-        f = NULL;
+        nvlog("dlss: frame interpolator settings changed - retiring old FG feature and making a new one");
+        nvmtl_dlss_enqueue_destroy(2, f, atomic_load_explicit(&g_cmd_submitted, memory_order_acquire) + 1);
+        *feature = NULL; f = NULL;
     }
     if (!f) {
         f = nvmtl_dlss_fg_feature_create(c->cb, &want); if (!f) return -1; *feature = f;

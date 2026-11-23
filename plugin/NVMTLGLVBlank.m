@@ -39,6 +39,7 @@ static struct {
     __typeof__(&CGWindowListCreateDescriptionFromArray) window_descriptions;
     __typeof__(&CGRectMakeWithDictionaryRepresentation) rect_from_dictionary;
     __typeof__(&CGGetDisplaysWithRect) displays_with_rect;
+    __typeof__(&CGGetDisplaysWithPoint) displays_with_point;
     __typeof__(&CGDisplayCopyDisplayMode) copy_display_mode;
     __typeof__(&CGDisplayModeGetRefreshRate) refresh_rate;
     __typeof__(&CGDisplayModeRelease) release_display_mode;
@@ -80,12 +81,20 @@ static uint64_t nvglvbl_window_period(uint32_t window)
     uint32_t displays = 0;
     if (windows && CFArrayGetCount(windows) > 0 &&
         gGLVBL.rect_from_dictionary(CFDictionaryGetValue(CFArrayGetValueAtIndex(windows, 0), *gGLVBL.window_bounds_key),
-                                    &bounds) &&
-        gGLVBL.displays_with_rect(bounds, 1, &display, &displays) == kCGErrorSuccess && displays) {
-        CGDisplayModeRef mode = gGLVBL.copy_display_mode(display);
-        if (mode) {
-            hz = gGLVBL.refresh_rate(mode);   // 0 for a display that does not say
-            gGLVBL.release_display_mode(mode);
+                                    &bounds)) {
+        // Prefer the display containing the window's center on dual-display setups (e.g. 144 Hz + 180 Hz)
+        // so a window slightly overlapping an adjacent display edge does not pick the wrong refresh rate.
+        CGPoint center = CGPointMake(bounds.origin.x + bounds.size.width * 0.5, bounds.origin.y + bounds.size.height * 0.5);
+        BOOL gotDisp = (gGLVBL.displays_with_point &&
+                        gGLVBL.displays_with_point(center, 1, &display, &displays) == kCGErrorSuccess && displays > 0);
+        if (!gotDisp)
+            gotDisp = (gGLVBL.displays_with_rect(bounds, 1, &display, &displays) == kCGErrorSuccess && displays > 0);
+        if (gotDisp) {
+            CGDisplayModeRef mode = gGLVBL.copy_display_mode(display);
+            if (mode) {
+                hz = gGLVBL.refresh_rate(mode);   // 0 for a display that does not say
+                gGLVBL.release_display_mode(mode);
+            }
         }
     }
     if (windows) CFRelease(windows);
@@ -139,6 +148,7 @@ static void nvglvbl_install(void)
     gGLVBL.window_descriptions = dlsym(RTLD_DEFAULT, "CGWindowListCreateDescriptionFromArray");
     gGLVBL.rect_from_dictionary = dlsym(RTLD_DEFAULT, "CGRectMakeWithDictionaryRepresentation");
     gGLVBL.displays_with_rect = dlsym(RTLD_DEFAULT, "CGGetDisplaysWithRect");
+    gGLVBL.displays_with_point = dlsym(RTLD_DEFAULT, "CGGetDisplaysWithPoint");
     gGLVBL.copy_display_mode = dlsym(RTLD_DEFAULT, "CGDisplayCopyDisplayMode");
     gGLVBL.refresh_rate = dlsym(RTLD_DEFAULT, "CGDisplayModeGetRefreshRate");
     gGLVBL.release_display_mode = dlsym(RTLD_DEFAULT, "CGDisplayModeRelease");
@@ -171,6 +181,7 @@ static void nvglvbl_image_added(const struct mach_header *header, intptr_t slide
 
 __attribute__((constructor)) static void nvmtl_gl_vblank_fix(void)
 {
+    nvmtl_conf_settle();
     if (getenv("NVMTL_NO_GL_VBLANK_FIX")) return;
     nvglvbl_install();
     if (!atomic_load(&gGLVBL.installed)) _dyld_register_func_for_add_image(nvglvbl_image_added);

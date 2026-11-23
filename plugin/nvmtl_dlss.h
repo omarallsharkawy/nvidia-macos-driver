@@ -81,6 +81,8 @@ typedef struct {
 int nvmtl_dlss_evaluate(VkCommandBuffer cmd, nvmtl_dlss_feature *f, const nvmtl_dlss_eval *e);
 /* The cfg a feature was created with. */
 const nvmtl_dlss_cfg *nvmtl_dlss_feature_cfg(const nvmtl_dlss_feature *f);
+/* Release an NGX Super Resolution feature after all referencing GPU work has completed. */
+void nvmtl_dlss_feature_destroy(nvmtl_dlss_feature *f);
 
 /* ---- Ray Reconstruction behind the MetalFX temporal denoised scaler ---- */
 /* 1 once the core is ready, reported Ray Reconstruction available, and NVMTL_DLSS_RR is not "0". */
@@ -104,6 +106,7 @@ typedef struct {
 } nvmtl_dlss_rr_eval;
 /* Record the denoise + upscale into cmd. All images must be in VK_IMAGE_LAYOUT_GENERAL. 0 on success. */
 int nvmtl_dlss_rr_evaluate(VkCommandBuffer cmd, nvmtl_dlss_rr_feature *f, const nvmtl_dlss_rr_eval *e);
+void nvmtl_dlss_rr_feature_destroy(nvmtl_dlss_rr_feature *f);
 
 /* ---- Frame Generation behind the MetalFX frame interpolator ---- */
 /* 1 once the core is ready, reported Frame Generation available, and NVMTL_DLSS_FG is not "0". */
@@ -129,6 +132,7 @@ typedef struct {
 } nvmtl_dlss_fg_eval;
 /* Record one evaluation into cmd; images must be in VK_IMAGE_LAYOUT_GENERAL. 0 on success. */
 int nvmtl_dlss_fg_evaluate(VkCommandBuffer cmd, nvmtl_dlss_fg_feature *f, const nvmtl_dlss_fg_eval *e);
+void nvmtl_dlss_fg_feature_destroy(nvmtl_dlss_fg_feature *f);
 
 /* Local check of the worker thread every call above runs on (stack size, one thread, environment kept). 0 = pass. */
 int nvmtl_dlss_selftest(void);

@@ -2925,12 +2925,12 @@ extern NSData *nvmtl_compile_library_entry(NSData *, NSString *, NSString *, NSS
     }
 
     NSData *air = _fns[name];
-    NSString *ll = _airs[name], *stage = _stages[name];
+    NSString *stage = _stages[name];
     // The library index hands every library made from the same file the same bitcode objects, so the entry's SPIR-V is
     // kept on its bitcode: a library made again (VideoToolbox makes one per transfer) neither hashes nor reads it again.
     NSData *known = air ? objc_getAssociatedObject(air, &gNVMTLEntrySpvAssoc) : nil;
     NSString *why = nil;
-    NSData *spv = known ?: nvmtl_compile_library_entry(air, ll, stage, name, &why);
+    NSData *spv = known ?: nvmtl_compile_library_entry(air, _airs[name], stage, name, &why);
     if (!spv) {
         if (error) *error = [NSError errorWithDomain:@"NVMTL" code:3
                                            userInfo:@{NSLocalizedDescriptionKey:why ?: @"entry translation failed"}];
@@ -2949,10 +2949,15 @@ extern NSData *nvmtl_compile_library_entry(NSData *, NSString *, NSString *, NSS
 - (id<MTLDevice>)device { return (id<MTLDevice>)gNVMTLMainDevice; }
 // NVMTL_AIR_DUMP=<dir>: write each function's AIR text, once, as <dir>/<name>.ll when an app first asks for it, so an
 // app that builds its libraries from memory can be studied offline kernel by kernel. Nothing is written when unset.
-static void nvmtl_air_dump(NSString *name, NSString *air)
+static const char *nvmtl_air_dump_dir(void)
 {
     static const char *dir; static dispatch_once_t once;
     dispatch_once(&once, ^{ dir = getenv("NVMTL_AIR_DUMP"); if (dir && !*dir) dir = NULL; });
+    return dir;
+}
+static void nvmtl_air_dump(NSString *name, NSString *air)
+{
+    const char *dir = nvmtl_air_dump_dir();
     if (!dir || !air.length || !name.length || [name containsString:@"/"]) return;
     NSString *path = [[@(dir) stringByAppendingPathComponent:name] stringByAppendingPathExtension:@"ll"];
     if ([[NSFileManager defaultManager] fileExistsAtPath:path]) return;
@@ -2962,7 +2967,7 @@ static void nvmtl_air_dump(NSString *name, NSString *air)
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name {
     NSData *spv = [_fns objectForKey:name];
     if (!spv && !_airs[name]) { nvlog("library: no function \"%s\" (this library holds %lu, externs %lu)", name.UTF8String, (unsigned long)(_fns.count + _airs.count), (unsigned long)_externs.count); return nil; }
-    nvmtl_air_dump(name, _airs[name]);
+    if (nvmtl_air_dump_dir()) nvmtl_air_dump(name, _airs[name]);
     if (spv && ([_stages[name] isEqualToString:@"mesh"] || [_stages[name] isEqualToString:@"object"])) {
         NVMTLFunction *f = [NVMTLFunction new]; f->_spirv = nil; f->_fname = name; f->_stage = _stages[name];
         f->_air = _airs[name]; f->_lib = self; return f;
@@ -3012,7 +3017,7 @@ static size_t nvmtl_fc_width(NSUInteger dataType)
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)cv error:(NSError **)error {
     if (error) *error = nil;
     NSData *spv = [_fns objectForKey:name];
-    nvmtl_air_dump(name, _airs[name]);
+    if (nvmtl_air_dump_dir()) nvmtl_air_dump(name, _airs[name]);
     if (!spv && _airs[name]) {
         if (cv) nvlog("library: visible function \"%s\" asked with constant values — carried on the function",
                       name.UTF8String);
@@ -4727,46 +4732,48 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
     [self nvmtlCloseVisibility];
     if (_begun) nvmtl_vk_cmd_end_render(&_cb->_c);
     nvmtl_hz_encoder_end(&_cb->_c);
-    NSMutableDictionary *groups = [NSMutableDictionary new];
-    BOOL needScratch = NO;
-    for (NSArray *record in _visRecords) {
-        NSNumber *offset = record[1];
-        NSMutableArray *queries = groups[offset];
-        if (!queries) { queries = [NSMutableArray new]; groups[offset] = queries; }
-        [queries addObject:record[0]];
-        if (queries.count > 1) needScratch = YES;
-    }
-    NVMTLBuffer *scratch = nil;
-    if (needScratch) {
-        scratch = [NVMTLBuffer new];
-        if (nvmtl_vk_buffer_create(_visRecords.count * 8, 0, &scratch->_b)) {
-            [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: accumulation scratch allocation failed"]]; scratch = nil;
-        } else {
-            if (!_cb->_scratch) _cb->_scratch = [NSMutableArray new];
-            [_cb->_scratch addObject:scratch];
+    if (_visRecords.count) {
+        NSMutableDictionary *groups = [NSMutableDictionary new];
+        BOOL needScratch = NO;
+        for (NSArray *record in _visRecords) {
+            NSNumber *offset = record[1];
+            NSMutableArray *queries = groups[offset];
+            if (!queries) { queries = [NSMutableArray new]; groups[offset] = queries; }
+            [queries addObject:record[0]];
+            if (queries.count > 1) needScratch = YES;
         }
-    }
-    size_t cursor = 0;
-    for (NSNumber *key in groups) {
-        NSArray *queries = groups[key]; size_t offset = key.unsignedLongLongValue;
-        if (queries.count > 1 && !scratch) continue;
-        nvk_buffer *dst = queries.count > 1 ? &scratch->_b : &_visBuf->_b;
-        size_t first = cursor;
-        for (NSNumber *value in queries) {
-            uint32_t query = value.unsignedIntValue;
-            size_t out = queries.count > 1 ? cursor++ * 8 : offset;
-            if (query == UINT32_MAX) {
-                if (nvmtl_vk_cmd_write_word(&_cb->_c, dst, out, 0) ||
-                    nvmtl_vk_cmd_write_word(&_cb->_c, dst, out + 4, 0))
-                    [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: empty result write failed at offset %zu", out]];
-            } else if (nvmtl_vk_cmd_copy_occlusion(&_cb->_c, query, 1, dst, out))
-                [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: result copy failed at offset %zu", out]];
+        NVMTLBuffer *scratch = nil;
+        if (needScratch) {
+            scratch = [NVMTLBuffer new];
+            if (nvmtl_vk_buffer_create(_visRecords.count * 8, 0, &scratch->_b)) {
+                [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: accumulation scratch allocation failed"]]; scratch = nil;
+            } else {
+                if (!_cb->_scratch) _cb->_scratch = [NSMutableArray new];
+                [_cb->_scratch addObject:scratch];
+            }
         }
-        if (queries.count > 1 && nvmtl_vk_cmd_sum_occlusion(&_cb->_c, &scratch->_b, first,
-                                                          (uint32_t)queries.count, &_visBuf->_b, offset))
-            [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: accumulation failed at offset %zu", offset]];
+        size_t cursor = 0;
+        for (NSNumber *key in groups) {
+            NSArray *queries = groups[key]; size_t offset = key.unsignedLongLongValue;
+            if (queries.count > 1 && !scratch) continue;
+            nvk_buffer *dst = queries.count > 1 ? &scratch->_b : &_visBuf->_b;
+            size_t first = cursor;
+            for (NSNumber *value in queries) {
+                uint32_t query = value.unsignedIntValue;
+                size_t out = queries.count > 1 ? cursor++ * 8 : offset;
+                if (query == UINT32_MAX) {
+                    if (nvmtl_vk_cmd_write_word(&_cb->_c, dst, out, 0) ||
+                        nvmtl_vk_cmd_write_word(&_cb->_c, dst, out + 4, 0))
+                        [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: empty result write failed at offset %zu", out]];
+                } else if (nvmtl_vk_cmd_copy_occlusion(&_cb->_c, query, 1, dst, out))
+                    [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: result copy failed at offset %zu", out]];
+            }
+            if (queries.count > 1 && nvmtl_vk_cmd_sum_occlusion(&_cb->_c, &scratch->_b, first,
+                                                              (uint32_t)queries.count, &_visBuf->_b, offset))
+                [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: accumulation failed at offset %zu", offset]];
+        }
+        _visRecords = nil;
     }
-    _visRecords = nil;
     if (_begun) return;
     if (_refused) return;
     switch (nvmtl_vk_pass_kind(&_pass)) {
@@ -7628,9 +7635,15 @@ static void nvmtl_late_present(void) {
     {
         // Frame-rate limiter (NVMTL_FPS_LIMIT / NVMTL_FPS_LIMIT_BATT in nvrm610.conf; see nvmtl_fps_limit.h).
         // When both differ, checks power source at most once every 3s without touching unrelated processes.
+        // Pacing is tracked per CAMetalLayer so multi-window apps on dual displays (e.g. 144 Hz + 180 Hz)
+        // are not throttled to FPS/N on battery.
+        enum { NVMTL_FPS_SLOTS = 16 };
+        static struct { uintptr_t layer; int fps; uint64_t seen_ns; nvmtl_fps_pacer pacer; } slots[NVMTL_FPS_SLOTS];
         static int fps_init, fps_ac, fps_batt, active_fps;
         static uint64_t last_ac_check_ns;
-        static nvmtl_fps_pacer pacer; static os_unfair_lock pace_lock = OS_UNFAIR_LOCK_INIT;
+        static os_unfair_lock pace_lock = OS_UNFAIR_LOCK_INIT;
+        id layerObj = [drawable respondsToSelector:@selector(layer)] ? ((id (*)(id, SEL))objc_msgSend)(drawable, @selector(layer)) : nil;
+        const uintptr_t lkey = (uintptr_t)(__bridge void *)layerObj;
         uint64_t wait = 0;
         os_unfair_lock_lock(&pace_lock);
         const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
@@ -7641,18 +7654,32 @@ static void nvmtl_late_present(void) {
             fps_batt = nvmtl_fps_limit_for(getenv("NVMTL_FPS_LIMIT_BATT"), me);
             active_fps = (fps_ac != fps_batt && nvmtl_on_battery()) ? fps_batt : fps_ac;
             last_ac_check_ns = now;
-            nvmtl_fps_pacer_init(&pacer, active_fps);
             if (active_fps) nvlog("frame-rate limit %d fps for %s", active_fps, me);
         } else if (fps_ac != fps_batt && now - last_ac_check_ns >= 3000000000ull) {
             last_ac_check_ns = now;
             const int want = nvmtl_on_battery() ? fps_batt : fps_ac;
             if (want != active_fps) {
                 active_fps = want;
-                nvmtl_fps_pacer_init(&pacer, active_fps);
+                for (int si = 0; si < NVMTL_FPS_SLOTS; si++) slots[si].fps = -1;
                 nvlog("frame-rate limit switched to %d fps for %s (%s)", active_fps, getprogname(), active_fps == fps_batt ? "battery" : "AC");
             }
         }
-        if (active_fps) wait = nvmtl_fps_pace(&pacer, now);
+        if (active_fps) {
+            int pick = -1, oldest = 0;
+            for (int si = 0; si < NVMTL_FPS_SLOTS; si++) {
+                if (slots[si].seen_ns && slots[si].layer == lkey) { pick = si; break; }
+                if (!slots[si].seen_ns) { if (pick < 0) pick = si; }
+                else if (slots[si].seen_ns < slots[oldest].seen_ns) oldest = si;
+            }
+            if (pick < 0) pick = oldest;
+            if (!slots[pick].seen_ns || slots[pick].layer != lkey || slots[pick].fps != active_fps) {
+                slots[pick].layer = lkey;
+                slots[pick].fps = active_fps;
+                nvmtl_fps_pacer_init(&slots[pick].pacer, active_fps);
+            }
+            slots[pick].seen_ns = now;
+            wait = nvmtl_fps_pace(&slots[pick].pacer, now);
+        }
         os_unfair_lock_unlock(&pace_lock);
         if (wait) { struct timespec ts = { (time_t)(wait / 1000000000ull), (long)(wait % 1000000000ull) }; nanosleep(&ts, NULL); }
     }

@@ -92,11 +92,8 @@ static inline int nvmtl_cf_write(const char *path, const void *payload, size_t n
             ssize_t w = write(fd, parts[p] + off, sizes[p] - off);
             if (w > 0) off += (size_t)w; else if (w < 0 && errno == EINTR) continue; else { err = errno ? errno : EIO; break; }
         }
-#ifdef F_FULLFSYNC
-    if (!err && fcntl(fd, F_FULLFSYNC) != 0 && fsync(fd) != 0) err = errno;
-#else
-    if (!err && fsync(fd) != 0) err = errno;
-#endif
+    /* Regenerable shader cache: atomic write+close+rename plus VCF1 length+FNV-1a footer validation on read
+       already rejects any torn/partial file without paying an NVMe F_FULLFSYNC barrier flush per shader. */
     if (close(fd) != 0 && !err) err = errno;
     if (!err && rename(tmp, path) != 0) err = errno;
     if (err) unlink(tmp);

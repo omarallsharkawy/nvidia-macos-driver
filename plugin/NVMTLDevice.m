@@ -21,6 +21,8 @@
 #include <notify.h>
 #include <mach-o/dyld.h>
 #include <unistd.h>
+#include <errno.h>
+#include <signal.h>
 #include <stdint.h>
 #include <vulkan/vulkan_core.h>
 #include <pthread.h>
@@ -486,6 +488,15 @@ static void nvmtl_nvencvt_register(bool decodersOnly)
         bool haveGen = nvmtl_gpu_profile_string(CFSTR("generation"), gen, sizeof gen);
         if (!nvmtl_nvencvt_selected(getenv("NVMTL_NVENCVT"), me, haveGen ? gen : NULL)) return;
         if (!strcmp(me, "WindowServer")) return;     // the codec registrars all stay out of it
+        bool decOnly = decodersOnly;
+        if (!decOnly && getenv("NVMTL_NO_NVENC")) {
+            decOnly = true;
+            nvlog("nvencvt: NVMTL_NO_NVENC set - registering decoders only in %s (keeping HW decode)", me);
+        }
+        if (decOnly && getenv("NVMTL_NO_NVDEC")) {
+            nvlog("nvencvt: NVMTL_NO_NVDEC set - not registering decoders in %s", me);
+            return;
+        }
         Dl_info di;
         if (!dladdr((const void *)nvmtl_nvencvt_register, &di) || !di.dli_fname) { nvlog("nvencvt: dladdr failed - not registering"); return; }
         char dir[1024], path[1200];
@@ -498,14 +509,14 @@ static void nvmtl_nvencvt_register(bool decodersOnly)
         void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
         if (!h) { nvlog("nvencvt: dlopen %s FAILED: %s", path, dlerror()); return; }
         typedef int32_t (*RegFn)(int);
-        const char *entry = decodersOnly ? "NVEncVT_RegisterDecoders" : "NVEncVT_Register";
+        const char *entry = decOnly ? "NVEncVT_RegisterDecoders" : "NVEncVT_Register";
         RegFn r = (RegFn)dlsym(h, entry);
         if (!r) { nvlog("nvencvt: %s has no %s", path, entry); return; }
         int rating = 1100;                           // above our own 1000, so the opt-in one wins where it is asked for
         const char *rv = getenv("NVMTL_NVENCVT_RATING");
         if (rv) { int v = atoi(rv); if (v > 0) rating = v; }
         int32_t st = r(rating);
-        nvlog("nvencvt: %s %s in %s (%s -> %d, rating %d, %s)", decodersOnly ? "decoders" : "codecs",
+        nvlog("nvencvt: %s %s in %s (%s -> %d, rating %d, %s)", decOnly ? "decoders" : "codecs",
               st ? "NOT registered" : "REGISTERED", me, entry, (int)st, rating, path);
     });
 }
@@ -1487,6 +1498,20 @@ typedef struct { uint32_t magic, done; uint64_t stamp_ns, seq; int32_t pid; uint
 #define NVMTL_BUSY_WAIT_NS  (35ull * 1000 * 1000)
 #define NVMTL_BUSY_STALE_NS (100ull * 1000 * 1000)
 #define NVMTL_BUSY_POLL_US 100
+static uint64_t nvmtl_busy_wait_limit_ns(void)
+{
+    static uint64_t lim; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        uint64_t ms = 35;
+        const char *e = getenv("NVMTL_BUSY_WAIT_MS");
+        if (e && *e) {
+            unsigned long long v = strtoull(e, NULL, 10);
+            if (v >= 1 && v <= 100) ms = (uint64_t)v;
+        }
+        lim = ms * 1000000ull;
+    });
+    return lim;
+}
 static CFStringRef nvmtl_busy_key(NSUInteger plane) {
     static const CFStringRef k[4] = { CFSTR("NVMTLBusyAt:p0"), CFSTR("NVMTLBusyAt:p1"), CFSTR("NVMTLBusyAt:p2"), CFSTR("NVMTLBusyAt:p3") };
     return plane < 4 ? (CFStringRef)CFRetain(k[plane]) : CFStringCreateWithFormat(NULL, NULL, CFSTR("NVMTLBusyAt:p%lu"), (unsigned long)plane);
@@ -1517,18 +1542,23 @@ static void nvmtl_busy_wait(IOSurfaceRef surf, NSUInteger plane)
 {
     nvmtl_busy_tag t;
     if (!nvmtl_busy_read(surf, plane, &t) || t.done || t.pid == getpid()) return;
+    if (t.pid > 0 && kill(t.pid, 0) != 0 && errno == ESRCH) return;
     const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     if (t.stamp_ns <= t0 && t0 - t.stamp_ns > NVMTL_BUSY_STALE_NS) return;
+    const uint64_t wait_limit = nvmtl_busy_wait_limit_ns();
+    unsigned polls = 0;
     for (;;) {
         const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
         if (now - t0 < 25000ull) {
             for (int spin = 0; spin < 32; spin++) __asm__ __volatile__("pause" ::: "memory");
         } else {
             usleep(NVMTL_BUSY_POLL_US);
+            polls++;
         }
         if (!nvmtl_busy_read(surf, plane, &t) || t.done || t.pid == getpid()) return;
+        if (polls && (polls & 7u) == 0 && t.pid > 0 && kill(t.pid, 0) != 0 && errno == ESRCH) return;
         const uint64_t now2 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
-        if (now2 - t0 > NVMTL_BUSY_WAIT_NS || (t.stamp_ns <= now2 && now2 - t.stamp_ns > NVMTL_BUSY_STALE_NS)) return;
+        if (now2 - t0 > wait_limit || (t.stamp_ns <= now2 && now2 - t.stamp_ns > NVMTL_BUSY_STALE_NS)) return;
     }
 }
 // Shared family-VRAM imports (nvmtl_import_cache.h). OFF unless NVMTL_SURF_IMPORT_CACHE=1: it is proven by
@@ -1585,7 +1615,21 @@ static uint64_t nvmtl_ic_cookie_read(IOSurfaceRef surf)
 }
 static void nvmtl_ic_destroy_all(unsigned char (*gone)[NVMTL_IC_PAYLOAD], int n)
 {
-    for (int i = 0; i < n; i++) { nvk_buffer b; memcpy(&b, gone[i], sizeof b); nvmtl_vk_buffer_destroy(&b); }
+    if (n <= 0) return;
+    static dispatch_queue_t q; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("nvmtl.ic-destroy", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+    });
+    nvk_buffer *batch = (nvk_buffer *)malloc((size_t)n * sizeof *batch);
+    if (!batch) {
+        for (int i = 0; i < n; i++) { nvk_buffer b; memcpy(&b, gone[i], sizeof b); nvmtl_vk_buffer_destroy(&b); }
+        return;
+    }
+    for (int i = 0; i < n; i++) memcpy(&batch[i], gone[i], sizeof batch[i]);
+    dispatch_async(q, ^{
+        for (int i = 0; i < n; i++) nvmtl_vk_buffer_destroy(&batch[i]);
+        free(batch);
+    });
 }
 static _Atomic uint64_t g_ic_next_expire;
 static void nvmtl_ic_expire_now(void)
@@ -1615,13 +1659,17 @@ static int nvmtl_ic_get(IOSurfaceRef surf, size_t need, nvk_buffer *out)
         nvmtl_ic_expire_now();
     if (nvmtl_vk_surface_vram(sid, 0, need, out)) return -1;
     static _Atomic uint64_t next = 1;
-    const uint64_t cookie = ((uint64_t)getpid() << 32) | (atomic_fetch_add(&next, 1) & 0xffffffffu);
-    CFNumberRef cn = CFNumberCreate(NULL, kCFNumberSInt64Type, &cookie); IOSurfaceSetValue(surf, nvmtl_ic_key(), cn); CFRelease(cn);
-    unsigned char evicted[NVMTL_IC_PAYLOAD], budget_gone[16][NVMTL_IC_PAYLOAD]; uintptr_t evicted_id = 0; int nb = 0;
+    /* Reuse any existing per-process cookie on `surf` so wrapping the same surface with a different size (or when full)
+       never overwrites the cookie and poisons live cache entries for that surface. */
+    const uint64_t cookie = have ? have : (((uint64_t)getpid() << 32) | (atomic_fetch_add(&next, 1) & 0xffffffffu));
+    unsigned char evicted[NVMTL_IC_PAYLOAD], budget_gone[16][NVMTL_IC_PAYLOAD]; uintptr_t evicted_id = 0; int nb = 0, inserted = 0;
     os_unfair_lock_lock(&g_ic_lock);
-    nvmtl_ic_insert(&g_ic, sid, need, cookie, (uintptr_t)out->buf, out, sizeof *out, evicted, &evicted_id);
+    inserted = nvmtl_ic_insert(&g_ic, sid, need, cookie, (uintptr_t)out->buf, out, sizeof *out, evicted, &evicted_id);
     nb = nvmtl_ic_evict_budget(&g_ic, nvmtl_ic_budget_bytes(), budget_gone, 16);
     os_unfair_lock_unlock(&g_ic_lock);
+    if (!have && inserted) {
+        CFNumberRef cn = CFNumberCreate(NULL, kCFNumberSInt64Type, &cookie); IOSurfaceSetValue(surf, nvmtl_ic_key(), cn); CFRelease(cn);
+    }
     if (evicted_id) nvmtl_ic_destroy_all(&evicted, 1);
     if (nb) nvmtl_ic_destroy_all(budget_gone, nb);
     return 0;
