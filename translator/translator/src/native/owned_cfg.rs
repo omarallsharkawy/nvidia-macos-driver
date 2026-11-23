@@ -2329,7 +2329,7 @@ fn glsl_ext_inst_contract(number: u32) -> Option<GlslExtInstContract> {
         Glsl::InterpolateAtCentroid => Some(Interpolate { extra: InterpolateExtra::None }),
         Glsl::InterpolateAtSample => Some(Interpolate { extra: InterpolateExtra::Sample }),
         Glsl::InterpolateAtOffset => Some(Interpolate { extra: InterpolateExtra::Offset }),
-        Glsl::FindILsb => Some(IntegerShapeSame {
+        Glsl::FindILsb | Glsl::FindUMsb => Some(IntegerShapeSame {
             arity: 1,
             width_32: true,
         }),
@@ -3729,6 +3729,7 @@ fn owned_group_non_uniform_error(
             | Op::GroupNonUniformShuffle
             | Op::GroupNonUniformShuffleXor
             | Op::GroupNonUniformShuffleDown
+            | Op::GroupNonUniformShuffleUp
             | Op::GroupNonUniformIAdd
             | Op::GroupNonUniformFAdd
             | Op::GroupNonUniformFMin
@@ -3797,7 +3798,8 @@ fn owned_group_non_uniform_error(
             }
             Op::GroupNonUniformShuffle
             | Op::GroupNonUniformShuffleXor
-            | Op::GroupNonUniformShuffleDown => {
+            | Op::GroupNonUniformShuffleDown
+            | Op::GroupNonUniformShuffleUp => {
                 instruction.operands.len() == 3
                     && matches!((result_type, operand_type(1)), (Some(result), Some(value))
                         if result == value && scalar_or_vector(result))

@@ -14572,10 +14572,15 @@ target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(i32 %tid, ptr addrspace(1) %u8_dst, ptr addrspace(1) %h4_dst) {
 entry:
-  %idx = zext i32 %tid to i64
-  %p0 = getelementptr inbounds <4 x i8>, ptr addrspace(1) %u8_dst, i64 %idx
+  %off4_32 = shl i32 %tid, 2
+  %off4 = zext i32 %off4_32 to i64
+  %s0 = getelementptr inbounds i8, ptr addrspace(1) %u8_dst, i64 %off4
+  %p0 = bitcast ptr addrspace(1) %s0 to ptr addrspace(1)
   store <4 x i8> <i8 1, i8 2, i8 3, i8 4>, ptr addrspace(1) %p0, align 4
-  %p1 = getelementptr inbounds <4 x half>, ptr addrspace(1) %h4_dst, i64 %idx
+  %off8_32 = shl i32 %tid, 3
+  %off8 = zext i32 %off8_32 to i64
+  %s1 = getelementptr inbounds i8, ptr addrspace(1) %h4_dst, i64 %off8
+  %p1 = bitcast ptr addrspace(1) %s1 to ptr addrspace(1)
   store <4 x half> <half 0xH3C00, half 0xH4000, half 0xH4200, half 0xH4400>, ptr addrspace(1) %p1, align 8
   ret void
 }
@@ -14615,8 +14620,10 @@ target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(i32 %tid, ptr addrspace(1) %dst) {
 entry:
-  %idx = zext i32 %tid to i64
-  %p = getelementptr inbounds half, ptr addrspace(1) %dst, i64 %idx
+  %off2_32 = shl i32 %tid, 1
+  %off2 = zext i32 %off2_32 to i64
+  %slot = getelementptr inbounds i8, ptr addrspace(1) %dst, i64 %off2
+  %p = bitcast ptr addrspace(1) %slot to ptr addrspace(1)
   store half 0xH3C00, ptr addrspace(1) %p, align 2
   ret void
 }
