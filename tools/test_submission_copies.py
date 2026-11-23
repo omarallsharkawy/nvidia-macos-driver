@@ -117,13 +117,14 @@ submission_fixture = r"""
 #import <objc/message.h>
 #import <IOSurface/IOSurface.h>
 #include <stdatomic.h>
+#include <pthread.h>
 #include <time.h>
 typedef struct { void *cb; } Commands;
 typedef struct { int unused; } nvmtl_inflight;
 @interface NVMTLSubmissionPart : NSObject { @public
     Commands commands; NSSet *resources; NSArray *surfaces, *scratch, *signals;
     id waitEvent, signalEvent; uint64_t value;
-    BOOL waitFolded, aheadEmpty, claimed; int aheadFailed; unsigned encoders;
+    BOOL waitFolded, aheadEmpty, claimed, aheadSubmitting; int aheadFailed; unsigned encoders;
     nvmtl_inflight *inflight;
     NSArray<NVMTLBuffer *> *copyInputs; BOOL copyInputsPrepared, hasHostCopies;
 } @end
@@ -149,6 +150,7 @@ typedef struct { int unused; } nvmtl_inflight;
 - (void)nvmtlFinishExecution:(NSError *)error;
 @end
 static _Atomic unsigned long long gsub_inflight, gsub_peak, gsub_ahead, gEvFold, gEvFoldEmpty, gSkipEmpty;
+static pthread_mutex_t nvmtl_ahead_submit_lock = PTHREAD_MUTEX_INITIALIZER;
 static NSMutableArray *nvmtl_quarantined_parts;
 static unsigned begins, waits, finishes, scheduled;
 static int submitResult; static BOOL allocationFails;

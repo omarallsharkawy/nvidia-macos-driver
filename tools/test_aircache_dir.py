@@ -18,6 +18,7 @@ HARNESS = r'''
 #import <Foundation/Foundation.h>
 #include <unistd.h>
 #include <limits.h>
+#include <sys/stat.h>
 #define nvlog(...) ((void)0)
 #define access(p, m) 0   /* a sandbox answers yes here and refuses at open */
 #define NVMTL_AIRCACHE_DIR_VAL getenv("TEST_SHARED")

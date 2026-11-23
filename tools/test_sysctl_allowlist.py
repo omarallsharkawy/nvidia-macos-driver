@@ -28,7 +28,9 @@ WRITABLE = {"nvrmfb_backlight_restore", "nvaccel_igpu", "nvaccel_iop", "nvaccelf
             # (EINVAL), and all five are root-only.
             "nvrmfb_flip_latch_auto", "nvrmfb_color_bpc", "nvrmfb_color_format", "nvrmfb_color_range", "nvrmfb_color_vibrance",
             # Reviewed 2.9: the opt-in unlocked page-off wait, an on/off integer read only as zero/non-zero; root-only.
-            "nvaccel_pageoff_unlocked_wait"}
+            "nvaccel_pageoff_unlocked_wait",
+            # Reviewed loq-perf: VRAM recycle pool on/off integer switch in NVRMFB (0 disables and drains); root-only.
+            "nvrmfb_vram_pool"}
 # Read-only diagnostics that print physical addresses or memory: registered only with boot-arg nvrmdiag=1, root only.
 PHYSICAL = {"nvrm_watchpage", "nvrm_physmap", "nvrm_pvsentinel", "nvrm_winwhy", "nvrm_pvchain", "nvrm_winraw"}
 DECL = re.compile(r"SYSCTL_(?:INT|UINT|QUAD|PROC|STRING|OPAQUE|LONG|ULONG)\s*\(\s*_debug\s*,\s*OID_AUTO\s*,\s*(\w+)\s*,(.*?)\)\s*;", re.S)
