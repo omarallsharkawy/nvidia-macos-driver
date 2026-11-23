@@ -602,7 +602,7 @@ fn air_barrier_memory_semantics(call: &LlCall) -> MemorySemantics {
         .and_then(|arg| air_i32_literal(&arg.value))
         .unwrap_or(0);
     if flags == 0 {
-        return MemorySemantics::NONE;
+        return MemorySemantics::RELAXED;
     }
     let mut semantics = MemorySemantics::ACQUIRE_RELEASE;
     if flags & 1 != 0 {

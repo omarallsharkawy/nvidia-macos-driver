@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::reflect::{SamplerAddressMode, SamplerCoordinates, SamplerMipFilter};
+use crate::reflect::{SamplerAddressMode, SamplerMipFilter};
 
 fn is_gradient_family(name: &str) -> bool {
     name.split('.').any(|token| token.ends_with("_grad"))
