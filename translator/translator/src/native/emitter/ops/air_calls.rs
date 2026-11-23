@@ -114,8 +114,12 @@ impl Emitter {
                     self.value_id_in(&call.args[1].value, &call.args[1].ty, instructions)?;
                 let scope_kind = self.atomic_i32_scope_for_arg(&call.args[0])?;
                 let scope = self.const_uint(scope_kind as u32)?;
-                let semantics_kind =
-                    Self::atomic_i32_memory_semantics(scope_kind, MemorySemantics::RELEASE);
+                let order = call.args.get(2).and_then(|arg| air_i32_literal(&arg.value));
+                let semantics_kind = Self::atomic_i32_memory_semantics(
+                    scope_kind,
+                    order,
+                    MemorySemantics::RELEASE,
+                );
                 let semantics = self.const_uint(semantics_kind.bits())?;
                 instructions.push(Self::inst(
                     Op::AtomicStore,
@@ -338,8 +342,12 @@ impl Emitter {
                 let ptr = self.atomic_i32_pointer_id(&call.args[0], instructions)?;
                 let scope_kind = self.atomic_i32_scope_for_arg(&call.args[0])?;
                 let scope = self.const_uint(scope_kind as u32)?;
-                let semantics_kind =
-                    Self::atomic_i32_memory_semantics(scope_kind, MemorySemantics::ACQUIRE);
+                let order = call.args.get(1).and_then(|arg| air_i32_literal(&arg.value));
+                let semantics_kind = Self::atomic_i32_memory_semantics(
+                    scope_kind,
+                    order,
+                    MemorySemantics::ACQUIRE,
+                );
                 let semantics = self.const_uint(semantics_kind.bits())?;
                 instructions.push(Self::inst(
                     Op::AtomicLoad,
@@ -468,10 +476,21 @@ impl Emitter {
                     self.value_id_in(&call.args[2].value, &call.args[2].ty, instructions)?;
                 let scope_kind = self.atomic_i32_scope_for_arg(&call.args[0])?;
                 let scope = self.const_uint(scope_kind as u32)?;
-                let success_semantics_kind =
-                    Self::atomic_i32_memory_semantics(scope_kind, MemorySemantics::ACQUIRE_RELEASE);
-                let failure_semantics_kind =
-                    Self::atomic_i32_memory_semantics(scope_kind, MemorySemantics::ACQUIRE);
+                let success_order = call.args.get(3).and_then(|arg| air_i32_literal(&arg.value));
+                let failure_order = call.args.get(4).and_then(|arg| air_i32_literal(&arg.value));
+                let success_semantics_kind = Self::atomic_i32_memory_semantics(
+                    scope_kind,
+                    success_order,
+                    MemorySemantics::ACQUIRE_RELEASE,
+                );
+                let mut failure_semantics_kind = Self::atomic_i32_memory_semantics(
+                    scope_kind,
+                    failure_order,
+                    MemorySemantics::ACQUIRE,
+                );
+                if (success_semantics_kind & MemorySemantics::ACQUIRE_RELEASE).is_empty() {
+                    failure_semantics_kind = MemorySemantics::RELAXED;
+                }
                 let success_semantics = self.const_uint(success_semantics_kind.bits())?;
                 let failure_semantics = self.const_uint(failure_semantics_kind.bits())?;
                 instructions.push(Self::inst(
@@ -554,8 +573,12 @@ impl Emitter {
         }
         let scope_kind = self.atomic_i32_scope_for_arg(&call.args[0])?;
         let scope = self.const_uint(scope_kind as u32)?;
-        let semantics_kind =
-            Self::atomic_i32_memory_semantics(scope_kind, MemorySemantics::ACQUIRE_RELEASE);
+        let order = call.args.get(2).and_then(|arg| air_i32_literal(&arg.value));
+        let semantics_kind = Self::atomic_i32_memory_semantics(
+            scope_kind,
+            order,
+            MemorySemantics::ACQUIRE_RELEASE,
+        );
         let semantics = self.const_uint(semantics_kind.bits())?;
         instructions.push(Self::inst(
             op,
@@ -578,6 +601,9 @@ fn air_barrier_memory_semantics(call: &LlCall) -> MemorySemantics {
         .first()
         .and_then(|arg| air_i32_literal(&arg.value))
         .unwrap_or(0);
+    if flags == 0 {
+        return MemorySemantics::NONE;
+    }
     let mut semantics = MemorySemantics::ACQUIRE_RELEASE;
     if flags & 1 != 0 {
         semantics |= MemorySemantics::UNIFORM_MEMORY | MemorySemantics::CROSS_WORKGROUP_MEMORY;
@@ -634,15 +660,6 @@ fn air_fence_memory_scope(call: &LlCall) -> Scope {
     }
 }
 
-fn air_barrier_memory_scope(call: &LlCall, default_scope: Scope) -> Scope {
-    let flags = call
-        .args
-        .first()
-        .and_then(|arg| air_i32_literal(&arg.value))
-        .unwrap_or(0);
-    if flags & (1 | 4) != 0 {
-        Scope::Device
-    } else {
-        default_scope
-    }
+fn air_barrier_memory_scope(_call: &LlCall, default_scope: Scope) -> Scope {
+    default_scope
 }

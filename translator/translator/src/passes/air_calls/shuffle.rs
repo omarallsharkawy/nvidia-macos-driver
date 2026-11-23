@@ -205,6 +205,19 @@ pub(in crate::passes) fn lower_simd_shuffle_down(
     let scope = ctx.const_uint(Scope::Subgroup as u32);
     let mut insts = Vec::new();
     let delta = subgroup_shuffle_index_u32(ctx, args[1], &mut insts)?;
+    if ctx.nvidia_fast_target {
+        insts.push(Instruction::new(
+            Op::GroupNonUniformShuffleDown,
+            Some(result_type),
+            Some(result),
+            vec![
+                Operand::IdScope(scope),
+                Operand::IdRef(args[0]),
+                Operand::IdRef(delta),
+            ],
+        ));
+        return Ok(insts);
+    }
     let uint = ctx.ty_uint();
     let lane = subgroup_lane_index_u32(ctx, &mut insts);
     let simd_lane = metal_simd_lane_local_u32(ctx, lane, &mut insts);
@@ -273,6 +286,19 @@ pub(in crate::passes) fn lower_simd_shuffle_up(
     let scope = ctx.const_uint(Scope::Subgroup as u32);
     let mut insts = Vec::new();
     let delta = subgroup_shuffle_index_u32(ctx, args[1], &mut insts)?;
+    if ctx.nvidia_fast_target {
+        insts.push(Instruction::new(
+            Op::GroupNonUniformShuffleUp,
+            Some(result_type),
+            Some(result),
+            vec![
+                Operand::IdScope(scope),
+                Operand::IdRef(args[0]),
+                Operand::IdRef(delta),
+            ],
+        ));
+        return Ok(insts);
+    }
     let uint = ctx.ty_uint();
     let lane = subgroup_lane_index_u32(ctx, &mut insts);
     let simd_lane = metal_simd_lane_local_u32(ctx, lane, &mut insts);

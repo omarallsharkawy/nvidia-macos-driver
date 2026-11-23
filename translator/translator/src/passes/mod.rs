@@ -122,6 +122,9 @@ pub struct TransformOptions {
     /// Colour attachments bound as Metal A8Unorm (bit per location). Vulkan has no A8 format, so the plugin backs
     /// them with R8 and the fragment output's alpha is written to every lane; the red lane is what the target keeps.
     pub a8_render_target_mask: u32,
+    /// Target NVIDIA warp32 Vulkan (NVK/Ada/Blackwell): emit direct 1-op warp32 subgroup ops,
+    /// FindILsb/FindUMsb for 32-bit ctz/clz, Exp2 for exp10, and direct Round for fast_round.
+    pub nvidia_fast_target: bool,
 }
 
 impl Default for TransformOptions {
@@ -140,11 +143,16 @@ impl Default for TransformOptions {
             runtime_storage_image_states: [None; TEXTURE_ARGUMENT_COUNT_USIZE],
             threadgroup_memory_lengths: [None; THREADGROUP_BUFFER_ARGUMENT_COUNT_USIZE],
             a8_render_target_mask: 0,
+            nvidia_fast_target: false,
         }
     }
 }
 
 impl TransformOptions {
+    pub fn with_nvidia_fast_target(mut self, enabled: bool) -> Self {
+        self.nvidia_fast_target = enabled;
+        self
+    }
     pub fn with_kernel_dispatch(
         mut self,
         dispatch: crate::reflect::KernelDispatch,
@@ -391,6 +399,7 @@ struct Ctx {
     synth_cache: HashMap<SynthCacheKey, Word>,
     singleton_types: HashMap<SingletonType, Word>,
     struct_cache: HashMap<(Op, Option<Word>, Vec<Operand>), Word>,
+    struct_cache_global_len: usize,
     phase_value_types: Option<HashMap<Word, Word>>,
     phase_type_positions: Option<HashMap<Word, (bool, usize)>>,
     image_dims: HashMap<Word, (Dim, bool)>,
@@ -422,6 +431,7 @@ struct Ctx {
     runtime_storage_image_states: [Option<RuntimeStorageImageState>; TEXTURE_ARGUMENT_COUNT_USIZE],
     threadgroup_memory_lengths: [Option<u32>; THREADGROUP_BUFFER_ARGUMENT_COUNT_USIZE],
     a8_render_target_mask: u32,
+    pub(in crate::passes) nvidia_fast_target: bool,
     a8_output_vars: HashSet<Word>,
     runtime_storage_image_values: HashMap<Word, (u32, RuntimeStorageImageState)>,
     applied_runtime_storage_image_indices: HashSet<u32>,
@@ -485,6 +495,7 @@ impl Ctx {
             synth_cache: HashMap::default(),
             singleton_types: HashMap::default(),
             struct_cache: HashMap::default(),
+            struct_cache_global_len: 0,
             phase_value_types: None,
             phase_type_positions: None,
             image_dims: HashMap::default(),
@@ -517,6 +528,7 @@ impl Ctx {
             runtime_storage_image_states: options.runtime_storage_image_states,
             threadgroup_memory_lengths: options.threadgroup_memory_lengths,
             a8_render_target_mask: options.a8_render_target_mask,
+            nvidia_fast_target: options.nvidia_fast_target,
             a8_output_vars: HashSet::default(),
             runtime_storage_image_values: HashMap::default(),
             applied_runtime_storage_image_indices: HashSet::default(),
@@ -1035,21 +1047,14 @@ impl Ctx {
     }
 
     fn get_or_create(&mut self, op: Op, result_type: Option<Word>, operands: Vec<Operand>) -> Word {
+        let cur_len = self.module.types_global_values.len();
+        if cur_len < self.struct_cache_global_len {
+            self.struct_cache.clear();
+        }
+        self.struct_cache_global_len = cur_len;
         let key = (op, result_type, operands.clone());
         if let Some(&id) = self.struct_cache.get(&key) {
-            // A cleanup between passes can drop an unused global this cache still names (a ConstantNull the NaN-to-zero
-            // conversion then selected: "owned Select references undefined id", Blender's light-probe kernel). Hand an id
-            // out only while it is still defined.
-            if self
-                .module
-                .types_global_values
-                .iter()
-                .chain(self.new_globals.iter())
-                .any(|inst| inst.result_id == Some(id))
-            {
-                return id;
-            }
-            self.struct_cache.remove(&key);
+            return id;
         }
         let mut highest_definition = 0;
         let mut existing = None;
@@ -3123,6 +3128,7 @@ pub(crate) fn transform_with_options_and_sidecar(
     ctx.module.types_global_values.append(&mut ctx.new_globals);
     stage_input::drop_unconsumed_placeholder_descriptor_loads(&mut ctx);
     module_cleanup::drop_unreferenced_global_variables(&mut ctx.module);
+    ctx.struct_cache.clear();
     module_cleanup::gc_dead_globals(&mut ctx);
     if !crate::env_vars::no_latch_trampoline_fold() {
         let folded = latch_trampoline::fold_latch_break_trampolines(&mut ctx.module);

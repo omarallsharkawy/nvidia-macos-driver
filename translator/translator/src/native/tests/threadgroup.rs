@@ -3359,6 +3359,86 @@ declare i32 @air.atomic.local.add.u.i32(ptr addrspace(3), i32, i32, i32, i1)
     let _ = std::fs::remove_dir_all(tmp);
 }
 
+#[test]
+fn native_nvidia_fast_target_emits_direct_warp32_subgroup_ops_and_bitops() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+define void @k(float %x, i32 %u, i16 %delta, i1 %pred, ptr addrspace(1) %out) {
+entry:
+  %scan = tail call float @air.simd_prefix_inclusive_sum.f32(float %x)
+  %down = tail call float @air.simd_shuffle_down.f32(float %scan, i16 %delta)
+  %up = tail call float @air.simd_shuffle_up.f32(float %down, i16 %delta)
+  %bf = tail call float @air.simd_broadcast_first.f32(float %up)
+  %e10 = tail call fast float @air.exp10.f32(float %bf)
+  %rnd = tail call fast float @air.fast_round.f32(float %e10)
+  %first = tail call i1 @air.simd_is_first()
+  %any = tail call i1 @air.simd_any(i1 %pred)
+  %all = tail call i1 @air.simd_all(i1 %pred)
+  %ballot = tail call i64 @air.simd_ballot(i1 %pred)
+  %tz = tail call i32 @air.ctz.i32(i32 %u, i1 false)
+  %lz = tail call i32 @air.clz.i32(i32 %u, i1 false)
+  %b32 = trunc i64 %ballot to i32
+  %sum0 = add i32 %tz, %lz
+  %sum1 = add i32 %sum0, %b32
+  %vote = and i1 %any, %all
+  %sel = or i1 %vote, %first
+  %sel_i = select i1 %sel, i32 %sum1, i32 0
+  %fbits = bitcast float %rnd to i32
+  %final = add i32 %sel_i, %fbits
+  store i32 %final, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare float @air.simd_prefix_inclusive_sum.f32(float)
+declare float @air.simd_shuffle_down.f32(float, i16)
+declare float @air.simd_shuffle_up.f32(float, i16)
+declare float @air.simd_broadcast_first.f32(float)
+declare float @air.exp10.f32(float)
+declare float @air.fast_round.f32(float)
+declare i1 @air.simd_is_first()
+declare i1 @air.simd_any(i1)
+declare i1 @air.simd_all(i1)
+declare i64 @air.simd_ballot(i1)
+declare i32 @air.ctz.i32(i32, i1)
+declare i32 @air.clz.i32(i32, i1)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 4, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"int", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_nvidia_fast_target_warp32_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let options = passes::TransformOptions::default().with_nvidia_fast_target(true);
+    let spv = crate::translate_sanitized_native_with_options(ll, Stage::Kernel, &tmp, options)
+        .expect("nvidia_fast_target translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpGroupNonUniformShuffleDown"), "{asm}");
+    assert!(asm.contains("OpGroupNonUniformShuffleUp"), "{asm}");
+    assert!(asm.contains("OpGroupNonUniformElect"), "{asm}");
+    assert!(asm.contains("OpGroupNonUniformBroadcastFirst"), "{asm}");
+    assert!(asm.contains("OpGroupNonUniformAll"), "{asm}");
+    assert!(asm.contains("OpGroupNonUniformAny"), "{asm}");
+    assert!(asm.contains(" FindILsb "), "{asm}");
+    assert!(asm.contains(" FindUMsb "), "{asm}");
+    assert!(asm.contains(" Exp2 "), "{asm}");
+    assert!(asm.contains(" Round "), "{asm}");
+    assert!(!asm.contains("OpGroupNonUniformShuffle "), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
 // Three dispatch-tail-guard arms lived here and were removed with the pass itself. They are
 // worth naming because they all PASSED while the thing they guarded was wrong, which is the trap: each arm
 // tested the pass against its own premise instead of against the plugin. The premise was that a Metal

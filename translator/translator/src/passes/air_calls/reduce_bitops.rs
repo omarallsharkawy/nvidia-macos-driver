@@ -177,7 +177,8 @@ pub(in crate::passes) fn lower_simd_sum(
     if !matches!(
         operation,
         GroupOperation::ExclusiveScan | GroupOperation::InclusiveScan
-    ) {
+    ) || ctx.nvidia_fast_target
+    {
         return Ok(vec![Instruction::new(
             op,
             Some(result_type),
@@ -193,13 +194,16 @@ pub(in crate::passes) fn lower_simd_sum(
         Some(native),
         operands,
     )];
+    // Use ExclusiveScan directly instead of `native - value` so lane 0 holding ±Inf
+    // cannot compute `Inf - Inf = NaN` and poison lanes 1..31 via the partition shuffle.
     let exclusive = if operation == GroupOperation::InclusiveScan {
         let exclusive = ctx.module.fresh_id();
+        let excl_operands = group_reduce_operands(ctx, scope, GroupOperation::ExclusiveScan, value);
         insts.push(Instruction::new(
-            subtract,
+            op,
             Some(result_type),
             Some(exclusive),
-            vec![Operand::IdRef(native), Operand::IdRef(value)],
+            excl_operands,
         ));
         exclusive
     } else {
@@ -653,6 +657,31 @@ pub(in crate::passes) fn ctz_scalar(
         Some(is_zero),
         vec![Operand::IdRef(arg), Operand::IdRef(zero)],
     )];
+    if ctx.nvidia_fast_target && width == 32 {
+        let ext = ctx.glsl();
+        let lsb = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::ExtInst,
+            Some(rty),
+            Some(lsb),
+            vec![
+                Operand::IdRef(ext),
+                Operand::LiteralExtInstInteger(GLSLstd450::FindILsb as u32),
+                Operand::IdRef(arg),
+            ],
+        ));
+        out.push(Instruction::new(
+            Op::Select,
+            Some(rty),
+            Some(res),
+            vec![
+                Operand::IdRef(is_zero),
+                Operand::IdRef(width_const),
+                Operand::IdRef(lsb),
+            ],
+        ));
+        return out;
+    }
 
     let mut y = arg;
     let mut count = zero;
@@ -742,6 +771,39 @@ pub(in crate::passes) fn clz_scalar(
         Some(is_zero),
         vec![Operand::IdRef(arg), Operand::IdRef(zero)],
     )];
+    if ctx.nvidia_fast_target && width == 32 {
+        let ext = ctx.glsl();
+        let msb = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::ExtInst,
+            Some(rty),
+            Some(msb),
+            vec![
+                Operand::IdRef(ext),
+                Operand::LiteralExtInstInteger(GLSLstd450::FindUMsb as u32),
+                Operand::IdRef(arg),
+            ],
+        ));
+        let top = ctx.const_int_of(rty, 31);
+        let leading = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::ISub,
+            Some(rty),
+            Some(leading),
+            vec![Operand::IdRef(top), Operand::IdRef(msb)],
+        ));
+        out.push(Instruction::new(
+            Op::Select,
+            Some(rty),
+            Some(res),
+            vec![
+                Operand::IdRef(is_zero),
+                Operand::IdRef(width_const),
+                Operand::IdRef(leading),
+            ],
+        ));
+        return out;
+    }
 
     let mut y = arg;
     let mut count = zero;

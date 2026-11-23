@@ -37,12 +37,35 @@ impl Emitter {
 
     pub(in crate::native::emitter) fn atomic_i32_memory_semantics(
         scope: Scope,
-        workgroup_semantics: MemorySemantics,
+        order: Option<i64>,
+        allowed: MemorySemantics,
     ) -> MemorySemantics {
-        if scope == Scope::Workgroup {
-            workgroup_semantics | MemorySemantics::WORKGROUP_MEMORY
+        let mem_bit = if scope == Scope::Workgroup {
+            MemorySemantics::WORKGROUP_MEMORY
         } else {
+            MemorySemantics::UNIFORM_MEMORY
+        };
+        // Vulkan SPIR-V forbids SequentiallyConsistent on atomic ops; map both acq_rel (4) and seq_cst (5)
+        // to AcquireRelease, then mask by the instruction's legally allowed bits (e.g. Load forbids Release,
+        // Store forbids Acquire).
+        let requested = match order {
+            Some(0) => MemorySemantics::RELAXED,
+            Some(2) => MemorySemantics::ACQUIRE,
+            Some(3) => MemorySemantics::RELEASE,
+            Some(4 | 5) => MemorySemantics::ACQUIRE_RELEASE,
+            _ => {
+                if scope == Scope::Workgroup {
+                    allowed
+                } else {
+                    MemorySemantics::RELAXED
+                }
+            }
+        };
+        let ordering = requested & allowed;
+        if ordering.is_empty() {
             MemorySemantics::RELAXED
+        } else {
+            ordering | mem_bit
         }
     }
 

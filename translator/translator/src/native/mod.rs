@@ -240,16 +240,25 @@ fn require_capability(module: &mut Module, capability: Capability) {
 #[cfg(test)]
 mod tests;
 
+pub(crate) fn requires_device_address_model_for_lowered(
+    san_ll: &str,
+    kern: Option<&crate::meta::KernMeta>,
+    entry: Option<&str>,
+) -> bool {
+    let san_ll = vec_scalar_merge::lower_vector_scalar_pointer_merge(san_ll);
+    let san_ll = inline::inline_pointer_select_consumers(&san_ll, entry).source;
+    ir::LlModule::parse_with_stage_meta(&san_ll, kern, entry)
+        .is_ok_and(|parsed| emit_tiers::requires_device_address_model(&parsed))
+}
+
+#[allow(dead_code)]
 pub(crate) fn requires_device_address_model_for_source(
     san_ll: &str,
     kern: Option<&crate::meta::KernMeta>,
     entry: Option<&str>,
 ) -> bool {
     let san_ll = lower_air_text(san_ll);
-    let san_ll = vec_scalar_merge::lower_vector_scalar_pointer_merge(&san_ll);
-    let san_ll = inline::inline_pointer_select_consumers(&san_ll, entry).source;
-    ir::LlModule::parse_with_stage_meta(&san_ll, kern, entry)
-        .is_ok_and(|parsed| emit_tiers::requires_device_address_model(&parsed))
+    requires_device_address_model_for_lowered(&san_ll, kern, entry)
 }
 
 /// See inline::inline_and_forward_object_fields: the retry form of a module that failed as written.

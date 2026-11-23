@@ -14,7 +14,7 @@ impl Emitter {
         }
         if raw.device_addr_base.is_some() {
             let ty = self.resolve_type(ty)?;
-            return self.emit_device_addr_store(&ty, value, raw, instructions);
+            return self.emit_device_addr_store(&ty, value, raw, access_align, instructions);
         }
         let resolved_ty = self.resolve_type(ty)?;
         let (store_size, _) = self.raw_type_size_align(&resolved_ty)?;
@@ -54,6 +54,26 @@ impl Emitter {
         self.emit_raw_store_unchecked(&resolved_ty, value, raw, access_align, instructions)
     }
 
+    fn attach_wide_word_store_hint(
+        &self,
+        raw: &RawBufferOffset,
+        extra_byte: u64,
+        access_align: Option<u64>,
+        instructions: &mut [Instruction],
+    ) {
+        if let Some(align) = self.wide_word_load_hint(raw, extra_byte, access_align) {
+            let mut stores = instructions
+                .iter_mut()
+                .filter(|i| i.class.opcode == Op::Store && i.operands.len() == 2);
+            if let (Some(store), None) = (stores.next(), stores.next()) {
+                store.operands.extend([
+                    Operand::MemoryAccess(spirv::MemoryAccess::ALIGNED),
+                    Operand::LiteralBit32(align),
+                ]);
+            }
+        }
+    }
+
     pub(in crate::native::emitter) fn emit_raw_store_unchecked(
         &mut self,
         ty: &LlType,
@@ -65,7 +85,145 @@ impl Emitter {
         match ty {
             LlType::Vector(elem, lanes) => {
                 let elem = self.resolve_type(elem)?;
+                if matches!(elem, LlType::Int(8))
+                    && *lanes >= 4
+                    && *lanes % 4 == 0
+                    && self.raw_byte_array_root_len(raw).is_none()
+                    && self.raw_word_access_can_use_word_index(raw, 0, access_align)
+                {
+                    let words = *lanes / 4;
+                    let u32_ty = self.type_id(&LlType::Int(32))?;
+                    let quad_ty = self.type_id(&LlType::Vector(Box::new(LlType::Int(8)), 4))?;
+                    let byte_ty = self.type_id(&LlType::Int(8))?;
+                    for chunk in 0..words {
+                        let packed = if *lanes == 4 {
+                            value
+                        } else {
+                            let mut parts = Vec::with_capacity(4);
+                            for slot in 0..4u32 {
+                                let id = self.fresh();
+                                instructions.push(Self::inst(
+                                    Op::CompositeExtract,
+                                    Some(byte_ty),
+                                    Some(id),
+                                    vec![
+                                        Operand::IdRef(value),
+                                        Operand::LiteralBit32(chunk * 4 + slot),
+                                    ],
+                                ));
+                                parts.push(Operand::IdRef(id));
+                            }
+                            let quad = self.fresh();
+                            instructions.push(Self::inst(
+                                Op::CompositeConstruct,
+                                Some(quad_ty),
+                                Some(quad),
+                                parts,
+                            ));
+                            quad
+                        };
+                        let word = self.fresh();
+                        instructions.push(Self::inst(
+                            Op::Bitcast,
+                            Some(u32_ty),
+                            Some(word),
+                            vec![Operand::IdRef(packed)],
+                        ));
+                        let at = 4 * u64::from(chunk);
+                        let start = instructions.len();
+                        self.emit_raw_word_store_for_access(
+                            raw,
+                            at,
+                            word,
+                            access_align,
+                            instructions,
+                        )?;
+                        if chunk % 2 == 0 && chunk + 1 < words {
+                            self.attach_wide_word_store_hint(
+                                raw,
+                                at,
+                                access_align,
+                                &mut instructions[start..],
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+                if matches!(elem, LlType::Half | LlType::Int(16) | LlType::BFloat)
+                    && *lanes >= 2
+                    && *lanes % 2 == 0
+                    && self.raw_byte_array_root_len(raw).is_none()
+                    && self.raw_word_access_can_use_word_index(raw, 0, access_align)
+                {
+                    let words = *lanes / 2;
+                    let u32_ty = self.type_id(&LlType::Int(32))?;
+                    let pair_ty = self.type_id(&LlType::Vector(Box::new(elem.clone()), 2))?;
+                    let elem_ty = self.type_id(&elem)?;
+                    for pair in 0..words {
+                        let packed = if *lanes == 2 {
+                            value
+                        } else {
+                            let lo = self.fresh();
+                            instructions.push(Self::inst(
+                                Op::CompositeExtract,
+                                Some(elem_ty),
+                                Some(lo),
+                                vec![
+                                    Operand::IdRef(value),
+                                    Operand::LiteralBit32(pair * 2),
+                                ],
+                            ));
+                            let hi = self.fresh();
+                            instructions.push(Self::inst(
+                                Op::CompositeExtract,
+                                Some(elem_ty),
+                                Some(hi),
+                                vec![
+                                    Operand::IdRef(value),
+                                    Operand::LiteralBit32(pair * 2 + 1),
+                                ],
+                            ));
+                            let both = self.fresh();
+                            instructions.push(Self::inst(
+                                Op::CompositeConstruct,
+                                Some(pair_ty),
+                                Some(both),
+                                vec![Operand::IdRef(lo), Operand::IdRef(hi)],
+                            ));
+                            both
+                        };
+                        let word = self.fresh();
+                        instructions.push(Self::inst(
+                            Op::Bitcast,
+                            Some(u32_ty),
+                            Some(word),
+                            vec![Operand::IdRef(packed)],
+                        ));
+                        let at = 4 * u64::from(pair);
+                        let start = instructions.len();
+                        self.emit_raw_word_store_for_access(
+                            raw,
+                            at,
+                            word,
+                            access_align,
+                            instructions,
+                        )?;
+                        if pair % 2 == 0 && pair + 1 < words {
+                            self.attach_wide_word_store_hint(
+                                raw,
+                                at,
+                                access_align,
+                                &mut instructions[start..],
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
                 let (elem_size, _) = self.raw_type_size_align(&elem)?;
+                let wide_lanes = elem_size == 4
+                    && matches!(elem, LlType::Float | LlType::Int(32))
+                    && *lanes >= 2
+                    && self.raw_byte_array_root_len(raw).is_none();
                 let elem_ty = self.type_id(&elem)?;
                 for lane in 0..*lanes {
                     let lane_id = self.fresh();
@@ -75,14 +233,28 @@ impl Emitter {
                         Some(lane_id),
                         vec![Operand::IdRef(value), Operand::LiteralBit32(lane)],
                     ));
+                    let at = lane as u64 * elem_size;
+                    let start = instructions.len();
                     self.emit_raw_scalar_store(
                         &elem,
                         lane_id,
                         raw,
-                        lane as u64 * elem_size,
+                        at,
                         access_align,
                         instructions,
                     )?;
+                    if wide_lanes
+                        && lane % 2 == 0
+                        && lane + 1 < *lanes
+                        && self.raw_word_access_can_use_word_index(raw, at, access_align)
+                    {
+                        self.attach_wide_word_store_hint(
+                            raw,
+                            at,
+                            access_align,
+                            &mut instructions[start..],
+                        );
+                    }
                 }
                 Ok(())
             }
@@ -295,6 +467,7 @@ impl Emitter {
                     Some(high),
                     vec![Operand::IdRef(shifted)],
                 ));
+                let start = instructions.len();
                 self.emit_raw_word_store_for_access(
                     raw,
                     extra_byte,
@@ -302,6 +475,16 @@ impl Emitter {
                     access_align,
                     instructions,
                 )?;
+                if self.raw_byte_array_root_len(raw).is_none()
+                    && self.raw_word_access_can_use_word_index(raw, extra_byte, access_align)
+                {
+                    self.attach_wide_word_store_hint(
+                        raw,
+                        extra_byte,
+                        access_align,
+                        &mut instructions[start..],
+                    );
+                }
                 self.emit_raw_word_store_for_access(
                     raw,
                     extra_byte + 4,
@@ -310,15 +493,33 @@ impl Emitter {
                     instructions,
                 )
             }
-            LlType::Half => {
-                self.emit_raw_subword_store(ty, value, raw, extra_byte, 2, instructions)
-            }
-            LlType::Int(16) | LlType::BFloat => {
-                self.emit_raw_subword_store(ty, value, raw, extra_byte, 2, instructions)
-            }
-            LlType::Int(8) => {
-                self.emit_raw_subword_store(ty, value, raw, extra_byte, 1, instructions)
-            }
+            LlType::Half => self.emit_raw_subword_store(
+                ty,
+                value,
+                raw,
+                extra_byte,
+                2,
+                access_align,
+                instructions,
+            ),
+            LlType::Int(16) | LlType::BFloat => self.emit_raw_subword_store(
+                ty,
+                value,
+                raw,
+                extra_byte,
+                2,
+                access_align,
+                instructions,
+            ),
+            LlType::Int(8) => self.emit_raw_subword_store(
+                ty,
+                value,
+                raw,
+                extra_byte,
+                1,
+                access_align,
+                instructions,
+            ),
             other => Err(format!(
                 "native emitter: raw store for {other:?} is not covered yet"
             )),
@@ -332,13 +533,19 @@ impl Emitter {
         raw: &RawBufferOffset,
         extra_byte: u64,
         element_size: u32,
+        access_align: Option<u64>,
         instructions: &mut Vec<Instruction>,
     ) -> Result<(), String> {
         let bits = self.emit_raw_subword_store_bits(ty, value, element_size, instructions)?;
-        self.emit_raw_byte_store_from_u32(bits, raw, extra_byte, instructions)?;
         if element_size == 1 {
-            return Ok(());
+            return self.emit_raw_byte_store_from_u32(bits, raw, extra_byte, instructions);
         }
+        if self.raw_offset_aligned_to(raw, extra_byte, 2)
+            || (access_align.unwrap_or(1) >= 2 && extra_byte % 2 == 0)
+        {
+            return self.emit_raw_u16_store_from_u32(bits, raw, extra_byte, instructions);
+        }
+        self.emit_raw_byte_store_from_u32(bits, raw, extra_byte, instructions)?;
 
         let uint_ty = self.type_id(&LlType::Int(32))?;
         let shift = self.const_uint(8)?;
@@ -350,6 +557,141 @@ impl Emitter {
             vec![Operand::IdRef(bits), Operand::IdRef(shift)],
         ));
         self.emit_raw_byte_store_from_u32(high, raw, extra_byte + 1, instructions)
+    }
+
+    fn emit_raw_u16_store_from_u32(
+        &mut self,
+        value: Word,
+        raw: &RawBufferOffset,
+        extra_byte: u64,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(), String> {
+        let uint_ty = self.type_id(&LlType::Int(32))?;
+        let byte_index = self.emit_raw_byte_index(raw, extra_byte, instructions)?;
+        let word_index = self.fresh();
+        let word_divisor = self.const_uint(4)?;
+        instructions.push(Self::inst(
+            Op::UDiv,
+            Some(uint_ty),
+            Some(word_index),
+            vec![Operand::IdRef(byte_index), Operand::IdRef(word_divisor)],
+        ));
+        let (ptr, storage) =
+            self.emit_raw_word_pointer_at_index_with_storage(raw, word_index, instructions)?;
+
+        let byte_lane = self.fresh();
+        let lane_mask = self.const_uint(2)?;
+        instructions.push(Self::inst(
+            Op::BitwiseAnd,
+            Some(uint_ty),
+            Some(byte_lane),
+            vec![Operand::IdRef(byte_index), Operand::IdRef(lane_mask)],
+        ));
+
+        let bits_per_byte = self.const_uint(8)?;
+        let shift = self.fresh();
+        instructions.push(Self::inst(
+            Op::IMul,
+            Some(uint_ty),
+            Some(shift),
+            vec![Operand::IdRef(byte_lane), Operand::IdRef(bits_per_byte)],
+        ));
+
+        let half_mask = self.const_uint(0xffff)?;
+        let half = self.fresh();
+        instructions.push(Self::inst(
+            Op::BitwiseAnd,
+            Some(uint_ty),
+            Some(half),
+            vec![Operand::IdRef(value), Operand::IdRef(half_mask)],
+        ));
+
+        let shifted_half = self.fresh();
+        instructions.push(Self::inst(
+            Op::ShiftLeftLogical,
+            Some(uint_ty),
+            Some(shifted_half),
+            vec![Operand::IdRef(half), Operand::IdRef(shift)],
+        ));
+
+        let shifted_mask = self.fresh();
+        instructions.push(Self::inst(
+            Op::ShiftLeftLogical,
+            Some(uint_ty),
+            Some(shifted_mask),
+            vec![Operand::IdRef(half_mask), Operand::IdRef(shift)],
+        ));
+        let inverted_mask = self.fresh();
+        let all_ones = self.const_uint(u32::MAX)?;
+        instructions.push(Self::inst(
+            Op::BitwiseXor,
+            Some(uint_ty),
+            Some(inverted_mask),
+            vec![Operand::IdRef(shifted_mask), Operand::IdRef(all_ones)],
+        ));
+
+        if storage == StorageClass::Private {
+            let old_word = self.fresh();
+            instructions.push(Self::inst(
+                Op::Load,
+                Some(uint_ty),
+                Some(old_word),
+                vec![Operand::IdRef(ptr)],
+            ));
+            let cleared = self.fresh();
+            instructions.push(Self::inst(
+                Op::BitwiseAnd,
+                Some(uint_ty),
+                Some(cleared),
+                vec![Operand::IdRef(old_word), Operand::IdRef(inverted_mask)],
+            ));
+            let new_word = self.fresh();
+            instructions.push(Self::inst(
+                Op::BitwiseOr,
+                Some(uint_ty),
+                Some(new_word),
+                vec![Operand::IdRef(cleared), Operand::IdRef(shifted_half)],
+            ));
+            instructions.push(Self::inst(
+                Op::Store,
+                None,
+                None,
+                vec![Operand::IdRef(ptr), Operand::IdRef(new_word)],
+            ));
+            return Ok(());
+        }
+        let scope_kind = if storage == StorageClass::Workgroup {
+            Scope::Workgroup
+        } else {
+            Scope::Device
+        };
+        let scope = self.const_uint(scope_kind as u32)?;
+        let semantics = self.const_uint(MemorySemantics::RELAXED.bits())?;
+        let old = self.fresh();
+        instructions.push(Self::inst(
+            Op::AtomicAnd,
+            Some(uint_ty),
+            Some(old),
+            vec![
+                Operand::IdRef(ptr),
+                Operand::IdScope(scope),
+                Operand::IdMemorySemantics(semantics),
+                Operand::IdRef(inverted_mask),
+            ],
+        ));
+        let old = self.fresh();
+        instructions.push(Self::inst(
+            Op::AtomicOr,
+            Some(uint_ty),
+            Some(old),
+            vec![
+                Operand::IdRef(ptr),
+                Operand::IdScope(scope),
+                Operand::IdMemorySemantics(semantics),
+                Operand::IdRef(shifted_half),
+            ],
+        ));
+        Ok(())
     }
 
     pub(in crate::native::emitter) fn emit_raw_subword_store_bits(

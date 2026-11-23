@@ -272,6 +272,7 @@ pub(in crate::passes) fn finalize(
     drop_dead_unreferenced_variables(ctx, &referenced_from_functions, &interface_ids);
     gc_dead_globals(ctx);
     drop_unused_scalar_width_capabilities(&mut ctx.module);
+    ctx.struct_cache.clear();
     drop_unrequired_capabilities(&mut ctx.module);
     let variable_pointer_requirements = drop_unused_variable_pointer_capabilities(ctx);
     add_needed_capabilities(ctx, variable_pointer_requirements);

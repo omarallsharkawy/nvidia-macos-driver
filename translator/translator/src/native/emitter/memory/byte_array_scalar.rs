@@ -46,12 +46,29 @@ impl Emitter {
                 ));
             }
             LlType::Int(64) => {
+                let start = instructions.len();
                 let low_word = self.emit_raw_word_load_for_access(
                     raw,
                     extra_byte,
                     access_align,
                     instructions,
                 )?;
+                if self.raw_byte_array_root_len(raw).is_none()
+                    && self.raw_word_access_can_use_word_index(raw, extra_byte, access_align)
+                {
+                    if let Some(align) = self.wide_word_load_hint(raw, extra_byte, access_align) {
+                        if let Some(load) = instructions[start..].iter_mut().rev().find(|i| {
+                            i.class.opcode == Op::Load
+                                && i.result_id == Some(low_word)
+                                && i.operands.len() == 1
+                        }) {
+                            load.operands.extend([
+                                Operand::MemoryAccess(spirv::MemoryAccess::ALIGNED),
+                                Operand::LiteralBit32(align),
+                            ]);
+                        }
+                    }
+                }
                 let high_word = self.emit_raw_word_load_for_access(
                     raw,
                     extra_byte + 4,

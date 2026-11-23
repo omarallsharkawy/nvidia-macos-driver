@@ -71,15 +71,28 @@ impl Defs<'_> {
     }
 }
 
-fn is_pure(op: Op) -> bool {
-    matches!(op, Op::IAdd | Op::ISub | Op::IMul | Op::UDiv | Op::SDiv | Op::UMod | Op::SMod | Op::SRem | Op::SNegate | Op::Not
+fn is_pure_non_memory(w: &Instruction) -> bool {
+    match w.class.opcode {
+        Op::IAdd | Op::ISub | Op::IMul | Op::UDiv | Op::SDiv | Op::UMod | Op::SMod | Op::SRem | Op::SNegate | Op::Not
         | Op::ShiftLeftLogical | Op::ShiftRightLogical | Op::ShiftRightArithmetic | Op::BitwiseAnd | Op::BitwiseOr | Op::BitwiseXor
         | Op::UConvert | Op::SConvert | Op::FConvert | Op::ConvertUToF | Op::ConvertSToF | Op::ConvertFToU | Op::ConvertFToS | Op::Bitcast
         | Op::ConvertPtrToU | Op::ConvertUToPtr | Op::CompositeExtract | Op::CompositeConstruct | Op::CompositeInsert | Op::VectorShuffle
-        | Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain | Op::Load | Op::Select | Op::CopyObject
+        | Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain | Op::Select | Op::CopyObject
         | Op::IEqual | Op::INotEqual | Op::ULessThan | Op::ULessThanEqual | Op::UGreaterThan | Op::UGreaterThanEqual
         | Op::SLessThan | Op::SLessThanEqual | Op::SGreaterThan | Op::SGreaterThanEqual | Op::LogicalAnd | Op::LogicalOr | Op::LogicalNot
-        | Op::FAdd | Op::FSub | Op::FMul | Op::FDiv | Op::FNegate)
+        | Op::FAdd | Op::FSub | Op::FMul | Op::FDiv | Op::FNegate
+        | Op::FOrdEqual | Op::FUnordEqual | Op::FOrdNotEqual | Op::FUnordNotEqual
+        | Op::FOrdLessThan | Op::FUnordLessThan | Op::FOrdGreaterThan | Op::FUnordGreaterThan
+        | Op::FOrdLessThanEqual | Op::FUnordLessThanEqual | Op::FOrdGreaterThanEqual | Op::FUnordGreaterThanEqual
+        | Op::IsNan | Op::IsInf | Op::BitFieldInsert | Op::BitFieldSExtract | Op::BitFieldUExtract
+        | Op::BitReverse | Op::BitCount | Op::Dot | Op::VectorTimesScalar => true,
+        Op::ExtInst => !matches!(w.operands.get(1), Some(Operand::LiteralExtInstInteger(35 | 51))),
+        _ => false,
+    }
+}
+
+fn is_pure(w: &Instruction) -> bool {
+    w.class.opcode == Op::Load || is_pure_non_memory(w)
 }
 
 enum Route { Byte(u32), Word }
@@ -111,6 +124,16 @@ fn load_word_ptr(w: &Instruction, d: &Defs<'_>, uint: u32) -> Option<(u32, u32, 
     w.operands.first().and_then(id).and_then(|p| d.word_ptr(p))
 }
 
+fn div4_of(d: &Defs<'_>, x: u32) -> Option<u32> {
+    let u = d.local.get(&x)?;
+    if u.result_type != Some(d.uint) { return None; }
+    match (u.class.opcode, u.operands.as_slice()) {
+        (Op::UDiv, [Operand::IdRef(b), Operand::IdRef(c)]) if d.constant(*c) == Some(4) => Some(*b),
+        (Op::ShiftRightLogical, [Operand::IdRef(b), Operand::IdRef(c)]) if d.constant(*c) == Some(2) => Some(*b),
+        _ => None,
+    }
+}
+
 fn plan_for_head(
     body: &[Instruction],
     i: usize,
@@ -123,25 +146,17 @@ fn plan_for_head(
     taken: &std::collections::HashSet<usize>,
     d: &Defs<'_>,
 ) -> Option<PlanEntry> {
-    let div4 = |x: u32| {
-        d.local.get(&x)
-            .filter(|u| u.class.opcode == Op::UDiv && u.result_type == Some(d.uint))
-            .and_then(|u| match u.operands.as_slice() {
-                [Operand::IdRef(b), Operand::IdRef(c)] if d.constant(*c) == Some(4) => Some(*b),
-                _ => None,
-            })
-    };
-    let b0_opt = div4(x0);
+    let b0_opt = div4_of(d, x0);
     let max_k = if quad_enabled && align >= 16 { 3usize } else { 1usize };
     let mut slots: [Option<usize>; 3] = [None; 3];
     let mut chosen: Option<Route> = None;
 
     for (j, w) in body.iter().enumerate().skip(i + 1).take(96) {
-        if !is_pure(w.class.opcode) { break; }
+        if !is_pure(w) { break; }
         if taken.contains(&j) { continue; }
         let Some((root1, _, xk)) = load_word_ptr(w, d, d.uint) else { continue };
         if root1 != root { continue; }
-        let bk_opt = div4(xk);
+        let bk_opt = div4_of(d, xk);
         for k in 1..=max_k {
             if slots[k - 1].is_some() { continue; }
             let matched = match (b0_opt, bk_opt, &chosen) {
@@ -251,6 +266,230 @@ pub fn fuse(m: &mut Module, next: &mut u32, uint: u32, ulong: u32, hints: &HashM
                 for (lane, &other_idx) in entry.others[..entry.lanes - 1].iter().enumerate() {
                     out.push(Instruction::new(Op::CompositeExtract, Some(uint), body[other_idx].result_id, vec![Operand::IdRef(v), Operand::LiteralBit32((lane + 1) as u32)]));
                 }
+                fused += 1;
+            }
+            m.functions[fi].blocks[bi].instructions = out;
+        }
+    }
+    fused
+}
+
+struct StorePlanEntry {
+    indices: [usize; 4],
+    vals: [u32; 4],
+    last: usize,
+    lanes: usize,
+    align: u32,
+    route: Route,
+    root: u32,
+    member: u32,
+    p0: u32,
+}
+
+fn store_word_info(
+    w: &Instruction,
+    d: &Defs<'_>,
+    psb_uint_ptrs: &std::collections::HashSet<u32>,
+    value_types: &HashMap<u32, u32>,
+) -> Option<(u32, u32, u32, u32, u32, u32)> {
+    if w.class.opcode != Op::Store { return None; }
+    let (p, val, align) = match w.operands.as_slice() {
+        [Operand::IdRef(p), Operand::IdRef(val), Operand::MemoryAccess(f), Operand::LiteralBit32(a)]
+            if *f == MemoryAccess::ALIGNED => (*p, *val, *a),
+        _ => return None,
+    };
+    if value_types.get(&val) != Some(&d.uint) { return None; }
+    if !d.local.get(&p).and_then(|inst| inst.result_type).is_some_and(|t| psb_uint_ptrs.contains(&t)) {
+        return None;
+    }
+    let (root, member, x) = d.word_ptr(p)?;
+    Some((p, val, align, root, member, x))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_store_for_head(
+    body: &[Instruction],
+    i: usize,
+    root: u32,
+    member: u32,
+    p0: u32,
+    v0: u32,
+    x0: u32,
+    align: u32,
+    quad_enabled: bool,
+    taken: &std::collections::HashSet<usize>,
+    d: &Defs<'_>,
+    psb_uint_ptrs: &std::collections::HashSet<u32>,
+    value_types: &HashMap<u32, u32>,
+) -> Option<StorePlanEntry> {
+    let b0_opt = div4_of(d, x0);
+    let max_k = if quad_enabled && align >= 16 { 3usize } else { 1usize };
+    let mut slots: [Option<(usize, u32)>; 3] = [None; 3];
+    let mut chosen: Option<Route> = None;
+
+    for (j, w) in body.iter().enumerate().skip(i + 1).take(96) {
+        if w.class.opcode == Op::Store {
+            if taken.contains(&j) { break; }
+            let Some((_, vk, _, root1, _, xk)) = store_word_info(w, d, psb_uint_ptrs, value_types) else { break };
+            if root1 != root { break; }
+            let bk_opt = div4_of(d, xk);
+            let mut matched_any = false;
+            for k in 1..=max_k {
+                if slots[k - 1].is_some() { continue; }
+                let matched = match (b0_opt, bk_opt, &chosen) {
+                    (Some(b0), Some(bk), None | Some(Route::Byte(_)))
+                        if d.differ_by(b0, bk, (k * 4) as u32) =>
+                    {
+                        chosen.get_or_insert(Route::Byte(b0));
+                        true
+                    }
+                    (_, _, None | Some(Route::Word)) if d.differ_by(x0, xk, k as u32) => {
+                        chosen.get_or_insert(Route::Word);
+                        true
+                    }
+                    _ => false,
+                };
+                if matched {
+                    slots[k - 1] = Some((j, vk));
+                    matched_any = true;
+                    break;
+                }
+            }
+            if !matched_any { break; }
+            if (0..max_k).all(|idx| slots[idx].is_some()) { break; }
+        } else if !is_pure_non_memory(w) {
+            break;
+        }
+    }
+
+    let route = chosen?;
+    match (quad_enabled && align >= 16, slots[0], slots[1], slots[2]) {
+        (true, Some((j1, v1)), Some((j2, v2)), Some((j3, v3))) => Some(StorePlanEntry {
+            indices: [i, j1, j2, j3],
+            vals: [v0, v1, v2, v3],
+            last: i.max(j1).max(j2).max(j3),
+            lanes: 4,
+            align: 16,
+            route,
+            root,
+            member,
+            p0,
+        }),
+        (_, Some((j1, v1)), _, _) => Some(StorePlanEntry {
+            indices: [i, j1, 0, 0],
+            vals: [v0, v1, 0, 0],
+            last: i.max(j1),
+            lanes: 2,
+            align: align.min(8),
+            route,
+            root,
+            member,
+            p0,
+        }),
+        _ => None,
+    }
+}
+
+pub fn fuse_stores(m: &mut Module, next: &mut u32, uint: u32, ulong: u32) -> usize {
+    let quad_enabled = std::env::var_os("NVMTL_NO_QUAD_WORD_LOAD").is_none();
+    let mut fresh = || { let n = *next; *next += 1; n };
+    let consts: HashMap<u32, (u32, u32)> = m.types_global_values.iter().filter(|i| i.class.opcode == Op::Constant)
+        .filter_map(|i| match i.operands.as_slice() { [Operand::LiteralBit32(k)] => Some((i.result_id?, (i.result_type?, *k))), _ => None }).collect();
+    let psb_uint_ptrs: std::collections::HashSet<u32> = m.types_global_values.iter()
+        .filter(|t| t.class.opcode == Op::TypePointer
+            && t.operands.as_slice() == [Operand::StorageClass(StorageClass::PhysicalStorageBuffer), Operand::IdRef(uint)])
+        .filter_map(|t| t.result_id)
+        .collect();
+    if psb_uint_ptrs.is_empty() { return 0; }
+    let mut global_value_types: HashMap<u32, u32> = HashMap::new();
+    for i in &m.types_global_values {
+        if let (Some(id), Some(ty)) = (i.result_id, i.result_type) {
+            global_value_types.insert(id, ty);
+        }
+    }
+    let mut vector2: Option<(u32, u32)> = None;
+    let mut vector4: Option<(u32, u32)> = None;
+    let mut fused = 0;
+    for fi in 0..m.functions.len() {
+        let local: HashMap<u32, Instruction> = m.functions[fi].blocks.iter().flat_map(|b| b.instructions.iter())
+            .filter_map(|i| Some((i.result_id?, i.clone()))).collect();
+        let mut value_types = global_value_types.clone();
+        for p in &m.functions[fi].parameters {
+            if let (Some(id), Some(ty)) = (p.result_id, p.result_type) {
+                value_types.insert(id, ty);
+            }
+        }
+        for i in local.values() {
+            if let (Some(id), Some(ty)) = (i.result_id, i.result_type) {
+                value_types.insert(id, ty);
+            }
+        }
+        let d = Defs { local: &local, consts: &consts, uint };
+        for bi in 0..m.functions[fi].blocks.len() {
+            let body = &m.functions[fi].blocks[bi].instructions;
+            let mut plan: Vec<StorePlanEntry> = Vec::new();
+            let mut taken = std::collections::HashSet::new();
+            for (i, w0) in body.iter().enumerate() {
+                if taken.contains(&i) { continue; }
+                let Some((p0, v0, align, root, member, x0)) = store_word_info(w0, &d, &psb_uint_ptrs, &value_types) else { continue };
+                if align < 8 || !align.is_power_of_two() { continue; }
+                if let Some(entry) = plan_store_for_head(body, i, root, member, p0, v0, x0, align, quad_enabled, &taken, &d, &psb_uint_ptrs, &value_types) {
+                    for &idx in &entry.indices[..entry.lanes] { taken.insert(idx); }
+                    plan.push(entry);
+                }
+            }
+            if plan.is_empty() { continue; }
+            let need2 = plan.iter().any(|p| p.lanes == 2);
+            let need4 = plan.iter().any(|p| p.lanes == 4);
+            if need2 && vector2.is_none() {
+                let v2 = find_or_push(&mut m.types_global_values, Op::TypeVector, vec![Operand::IdRef(uint), Operand::LiteralBit32(2)], &mut fresh);
+                let pv2 = find_or_push(&mut m.types_global_values, Op::TypePointer,
+                    vec![Operand::StorageClass(StorageClass::PhysicalStorageBuffer), Operand::IdRef(v2)], &mut fresh);
+                vector2 = Some((v2, pv2));
+            }
+            if need4 && vector4.is_none() {
+                let v4 = find_or_push(&mut m.types_global_values, Op::TypeVector, vec![Operand::IdRef(uint), Operand::LiteralBit32(4)], &mut fresh);
+                let pv4 = find_or_push(&mut m.types_global_values, Op::TypePointer,
+                    vec![Operand::StorageClass(StorageClass::PhysicalStorageBuffer), Operand::IdRef(v4)], &mut fresh);
+                vector4 = Some((v4, pv4));
+            }
+            let body = std::mem::take(&mut m.functions[fi].blocks[bi].instructions);
+            let dropped: std::collections::HashSet<usize> = plan.iter()
+                .flat_map(|p| {
+                    let last = p.last;
+                    p.indices[..p.lanes].iter().copied().filter(move |&idx| idx != last)
+                })
+                .collect();
+            let mut out = Vec::with_capacity(body.len() + 8 * plan.len());
+            for (i, inst) in body.iter().enumerate() {
+                if dropped.contains(&i) { continue; }
+                let Some(entry) = plan.iter().find(|p| p.last == i) else { out.push(inst.clone()); continue };
+                let address = match entry.route {
+                    Route::Byte(b0) => {
+                        let (p, u, o, a) = (fresh(), fresh(), fresh(), fresh());
+                        out.push(Instruction::new(Op::InBoundsAccessChain, local[&entry.p0].result_type, Some(p), vec![Operand::IdRef(entry.root), Operand::IdRef(entry.member), Operand::IdRef(entry.member)]));
+                        out.push(Instruction::new(Op::ConvertPtrToU, Some(ulong), Some(u), vec![Operand::IdRef(p)]));
+                        out.push(Instruction::new(Op::UConvert, Some(ulong), Some(o), vec![Operand::IdRef(b0)]));
+                        out.push(Instruction::new(Op::IAdd, Some(ulong), Some(a), vec![Operand::IdRef(u), Operand::IdRef(o)]));
+                        a
+                    }
+                    Route::Word => {
+                        let u = fresh();
+                        out.push(Instruction::new(Op::ConvertPtrToU, Some(ulong), Some(u), vec![Operand::IdRef(entry.p0)]));
+                        u
+                    }
+                };
+                let (v_ty, pv_ty) = if entry.lanes == 4 { vector4.unwrap() } else { vector2.unwrap() };
+                let (q, v) = (fresh(), fresh());
+                let vals: Vec<Operand> = entry.vals[..entry.lanes].iter().map(|&val| Operand::IdRef(val)).collect();
+                out.push(Instruction::new(Op::CompositeConstruct, Some(v_ty), Some(v), vals));
+                out.push(Instruction::new(Op::ConvertUToPtr, Some(pv_ty), Some(q), vec![Operand::IdRef(address)]));
+                out.push(Instruction::new(Op::Store, None, None, vec![
+                    Operand::IdRef(q),
+                    Operand::IdRef(v),
+                    Operand::MemoryAccess(MemoryAccess::ALIGNED),
+                    Operand::LiteralBit32(entry.align),
+                ]));
                 fused += 1;
             }
             m.functions[fi].blocks[bi].instructions = out;
@@ -483,5 +722,46 @@ OpFunctionEnd
             .replace("%b3 = OpIAdd %uint %twelve %base\n%w3 = OpUDiv %uint %b3 %four", "%w3 = OpIAdd %uint %w0 %three");
         assert_eq!(census(&t), (vec![16], 0));
         assert_eq!(vector_lanes(&t), vec![4]);
+    }
+    #[test] fn shift_right_two_byte_route_fuses_to_v4() {
+        let t = QUAD
+            .replace("OpUDiv %uint %b0 %four", "OpShiftRightLogical %uint %b0 %two")
+            .replace("OpUDiv %uint %b1 %four", "OpShiftRightLogical %uint %b1 %two")
+            .replace("OpUDiv %uint %b2 %four", "OpShiftRightLogical %uint %b2 %two")
+            .replace("OpUDiv %uint %b3 %four", "OpShiftRightLogical %uint %b3 %two");
+        assert_eq!(census(&t), (vec![16], 0));
+        assert_eq!(vector_lanes(&t), vec![4]);
+    }
+    fn store_vector_lanes(text: &str) -> Vec<(u32, u32)> {
+        let input = source(text); validate(&input);
+        let output = lower(&input).unwrap(); validate(&output);
+        let m: Module = rspirv::dr::load_bytes(&output).unwrap();
+        let types: std::collections::HashMap<u32, rspirv::dr::Instruction> =
+            m.types_global_values.iter().filter_map(|i| Some((i.result_id?, i.clone()))).collect();
+        let mut value_types: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        for i in m.all_inst_iter() {
+            if let (Some(id), Some(ty)) = (i.result_id, i.result_type) { value_types.insert(id, ty); }
+        }
+        m.functions.iter().flat_map(|f| f.blocks.iter()).flat_map(|b| b.instructions.iter())
+            .filter(|i| i.class.opcode == Op::Store)
+            .filter_map(|i| match i.operands.as_slice() {
+                [_, Operand::IdRef(val), Operand::MemoryAccess(f), Operand::LiteralBit32(a)] if *f == MemoryAccess::ALIGNED => {
+                    let ty = types.get(value_types.get(val)?)?;
+                    if ty.class.opcode != Op::TypeVector { return None; }
+                    match ty.operands.get(1) {
+                        Some(Operand::LiteralBit32(n)) => Some((*n, *a)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect()
+    }
+    #[test] fn quad_store_aligned16_fuses_to_v4() {
+        let t = QUAD.replace(
+            "%s01 = OpIAdd %uint %x0 %x1\n%s23 = OpIAdd %uint %x2 %x3\n%s = OpIAdd %uint %s01 %s23\n%po = OpAccessChain %pu %out %zero %g\nOpStore %po %s",
+            "%ow0 = OpIMul %uint %g %four\n%ow1 = OpIAdd %uint %ow0 %one\n%ow2 = OpIAdd %uint %ow0 %two\n%ow3 = OpIAdd %uint %ow0 %three\n%op0 = OpInBoundsAccessChain %pu %out %zero %ow0\nOpStore %op0 %x0 Aligned 16\n%op1 = OpInBoundsAccessChain %pu %out %zero %ow1\nOpStore %op1 %x1\n%op2 = OpInBoundsAccessChain %pu %out %zero %ow2\nOpStore %op2 %x2\n%op3 = OpInBoundsAccessChain %pu %out %zero %ow3\nOpStore %op3 %x3",
+        );
+        assert_eq!(store_vector_lanes(&t), vec![(4, 16)]);
     }
 }

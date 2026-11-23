@@ -276,6 +276,7 @@ fn lower_addresses(bytes: &[u8]) -> Result<Vec<u8>, String> {
         f.blocks[0].instructions.splice(at..at,prelude);
     }
     if std::env::var_os("NVMTL_NO_WIDE_WORD_LOAD").is_none() { crate::wide_loads::fuse(&mut m, &mut next, uint, ulong, &wide_hints); }
+    if std::env::var_os("NVMTL_NO_WIDE_WORD_STORE").is_none() { crate::wide_loads::fuse_stores(&mut m, &mut next, uint, ulong); }
     m.header.as_mut().unwrap().bound=next;
     let result:Vec<u8>=m.assemble().iter().flat_map(|w|w.to_le_bytes()).collect();
     metal2vulkan::canonicalize_spirv_bytes(&result)

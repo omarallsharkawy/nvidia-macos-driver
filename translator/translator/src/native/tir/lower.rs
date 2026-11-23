@@ -377,8 +377,11 @@ pub(in crate::native) fn push_inst_line(
         .next()
         .unwrap_or("")
         .to_string();
-    let fast_math = rhs_of(line).split_whitespace().nth(1) == Some("fast");
     let float_math_mode = granted_float_relaxations(rhs_of(line));
+    let fast_math = rhs_of(line).split_whitespace().nth(1) == Some("fast")
+        || (matches!(opcode.as_str(), "fmul" | "fadd" | "fsub" | "fdiv")
+            && float_math_mode.is_none()
+            && rhs_grants_fast_math(rhs_of(line)));
     let alloca_ty = if opcode == "alloca" {
         resolve_alloca_ty(line)
     } else {
@@ -500,6 +503,17 @@ pub(in crate::native) fn push_inst_line(
             payload: data,
         }),
     });
+}
+
+fn rhs_grants_fast_math(rhs: &str) -> bool {
+    let mut tokens = rhs.split_whitespace();
+    if !matches!(tokens.next(), Some("fmul" | "fadd" | "fsub" | "fdiv")) {
+        return false;
+    }
+    let flags = tokens
+        .take_while(|token| token.chars().all(|c| c.is_ascii_lowercase()))
+        .collect::<Vec<_>>();
+    flags.contains(&"fast") || FloatMathMode::from_llvm_flags(&flags).grants_every_rewrite()
 }
 
 fn granted_float_relaxations(rhs: &str) -> Option<FloatMathMode> {

@@ -91,6 +91,7 @@ pub extern "C" fn nvmtl_translate_set_kernel_stage_in(words: *const u32, count: 
 
 fn apply_tg(mut o: metal2vulkan::passes::TransformOptions) -> metal2vulkan::passes::TransformOptions {
     o = apply_rsc(o);
+    o.nvidia_fast_target = std::env::var_os("NVMTL_NO_NVIDIA_FAST_LOWERING").is_none();
     o.kernel_stage_in = STAGE_IN.with(|c| c.get());
     // Bit 2 is an explicit guarantee from the plugin: no rate map can be created or bound.
     o.no_rasterization_rate_maps = CAPS.load(Ordering::Relaxed) & 4 != 0;

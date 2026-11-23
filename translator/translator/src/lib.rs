@@ -748,7 +748,7 @@ pub fn reflect_sanitized(
     reflection.refine_buffer_access_from_entry(san_ll);
     reflection.add_static_samplers(san_ll)?;
     if stage == passes::Stage::Kernel
-        && native::requires_device_address_model_for_source(
+        && native::requires_device_address_model_for_lowered(
             san_ll,
             stage_meta.kern.as_ref(),
             stage_meta.entry_name.as_deref(),

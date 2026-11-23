@@ -14564,3 +14564,140 @@ declare { i32, float, i32, i32, i8 addrspace(1)*, i32, i32, <2 x float>, i1 } @a
     );
     tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
 }
+
+#[test]
+fn native_raw_packed_uchar4_and_half4_stores_avoid_byte_atomics() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+define void @k(i32 %tid, ptr addrspace(1) %u8_dst, ptr addrspace(1) %h4_dst) {
+entry:
+  %idx = zext i32 %tid to i64
+  %p0 = getelementptr inbounds <4 x i8>, ptr addrspace(1) %u8_dst, i64 %idx
+  store <4 x i8> <i8 1, i8 2, i8 3, i8 4>, ptr addrspace(1) %p0, align 4
+  %p1 = getelementptr inbounds <4 x half>, ptr addrspace(1) %h4_dst, i64 %idx
+  store <4 x half> <half 0xH3C00, half 0xH4000, half 0xH4200, half 0xH4400>, ptr addrspace(1) %p1, align 8
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uchar4", !"air.arg_name", !"u8_dst"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"half4", !"air.arg_name", !"h4_dst"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_packed_subword_vec_stores_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(!asm.contains("OpAtomicAnd"), "{asm}");
+    assert!(!asm.contains("OpAtomicOr"), "{asm}");
+    assert!(asm.matches("OpStore").count() >= 3, "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn native_raw_aligned_scalar_half_store_uses_single_16bit_atomic_pair() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+define void @k(i32 %tid, ptr addrspace(1) %dst) {
+entry:
+  %idx = zext i32 %tid to i64
+  %p = getelementptr inbounds half, ptr addrspace(1) %dst, i64 %idx
+  store half 0xH3C00, ptr addrspace(1) %p, align 2
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"half", !"air.arg_name", !"dst"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_aligned_scalar_half_store_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert_eq!(asm.matches("OpAtomicAnd").count(), 1, "{asm}");
+    assert_eq!(asm.matches("OpAtomicOr").count(), 1, "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn native_bda_access_align_honors_v4_aligned16_and_unaligned_align1() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+%Args = type { ptr addrspace(1), ptr addrspace(1) }
+
+define void @k(ptr addrspace(2) %args, i32 %tid) {
+entry:
+  %idx = zext i32 %tid to i64
+  %f0 = getelementptr inbounds %Args, ptr addrspace(2) %args, i64 0, i32 0
+  %p0 = load ptr addrspace(1), ptr addrspace(2) %f0, align 8
+  %f1 = getelementptr inbounds %Args, ptr addrspace(2) %args, i64 0, i32 1
+  %p1 = load ptr addrspace(1), ptr addrspace(2) %f1, align 8
+  %vptr = getelementptr inbounds <4 x float>, ptr addrspace(1) %p0, i64 %idx
+  %vec = load <4 x float>, ptr addrspace(1) %vptr, align 16
+  %uptr = getelementptr inbounds i8, ptr addrspace(1) %p0, i64 %idx
+  %unaligned = load i64, ptr addrspace(1) %uptr, align 1
+  %vout = getelementptr inbounds <4 x float>, ptr addrspace(1) %p1, i64 %idx
+  store <4 x float> %vec, ptr addrspace(1) %vout, align 16
+  %uout = getelementptr inbounds i8, ptr addrspace(1) %p1, i64 %idx
+  store i64 %unaligned, ptr addrspace(1) %uout, align 1
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !6}
+!3 = !{i32 0, !"air.indirect_buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !4, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"Args", !"air.arg_name", !"args"}
+!4 = !{i32 0, i32 8, i32 0, !"float4*", !"src", !"air.indirect_argument", !5, i32 8, i32 8, i32 0, !"float4*", !"dst", !"air.indirect_argument", !7}
+!5 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"src"}
+!6 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+!7 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"dst"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_bda_access_align_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("PhysicalStorageBuffer64"), "{asm}");
+    assert!(asm.contains("Aligned 16"), "expected Aligned 16 on v4 BDA access:\n{asm}");
+    assert!(asm.contains("Aligned 1"), "expected Aligned 1 on packed i64 BDA access:\n{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}

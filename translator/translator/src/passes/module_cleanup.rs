@@ -87,6 +87,7 @@ pub(super) fn drop_dead_unreferenced_variables(
         };
         function_refs.contains(&id) || interface_ids.contains(&id)
     });
+    ctx.struct_cache.clear();
 }
 
 fn targets_any(instruction: &Instruction, removed: &HashSet<Word>) -> bool {

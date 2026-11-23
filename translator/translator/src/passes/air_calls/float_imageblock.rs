@@ -356,18 +356,130 @@ pub(in crate::passes) fn lower_float_math(
             ),
         ]);
     }
-    if (name.starts_with("air.cospi.") || name.starts_with("air.fast_cospi.")) && args.len() == 1 {
+    if name.starts_with("air.fast_cospi.") && args.len() == 1 {
+        let ext = ctx.glsl();
+        let n = vector_len(ctx, rty);
+        let pi = splat_or_scalar(ctx, rty, std::f32::consts::PI, n);
+        let scaled = ctx.module.fresh_id();
+        return Ok(vec![
+            Instruction::new(
+                Op::FMul,
+                Some(rty),
+                Some(scaled),
+                vec![Operand::IdRef(args[0]), Operand::IdRef(pi)],
+            ),
+            Instruction::new(
+                Op::ExtInst,
+                Some(rty),
+                Some(res),
+                vec![
+                    Operand::IdRef(ext),
+                    Operand::LiteralExtInstInteger(GLSLstd450::Cos as u32),
+                    Operand::IdRef(scaled),
+                ],
+            ),
+        ]);
+    }
+    if name.starts_with("air.fast_sinpi.") && args.len() == 1 {
+        let ext = ctx.glsl();
+        let n = vector_len(ctx, rty);
+        let pi = splat_or_scalar(ctx, rty, std::f32::consts::PI, n);
+        let scaled = ctx.module.fresh_id();
+        return Ok(vec![
+            Instruction::new(
+                Op::FMul,
+                Some(rty),
+                Some(scaled),
+                vec![Operand::IdRef(args[0]), Operand::IdRef(pi)],
+            ),
+            Instruction::new(
+                Op::ExtInst,
+                Some(rty),
+                Some(res),
+                vec![
+                    Operand::IdRef(ext),
+                    Operand::LiteralExtInstInteger(GLSLstd450::Sin as u32),
+                    Operand::IdRef(scaled),
+                ],
+            ),
+        ]);
+    }
+    if name.starts_with("air.fast_tanpi.") && args.len() == 1 {
+        let ext = ctx.glsl();
+        let n = vector_len(ctx, rty);
+        let pi = splat_or_scalar(ctx, rty, std::f32::consts::PI, n);
+        let scaled = ctx.module.fresh_id();
+        let sin = ctx.module.fresh_id();
+        let cos = ctx.module.fresh_id();
+        return Ok(vec![
+            Instruction::new(
+                Op::FMul,
+                Some(rty),
+                Some(scaled),
+                vec![Operand::IdRef(args[0]), Operand::IdRef(pi)],
+            ),
+            Instruction::new(
+                Op::ExtInst,
+                Some(rty),
+                Some(sin),
+                vec![
+                    Operand::IdRef(ext),
+                    Operand::LiteralExtInstInteger(GLSLstd450::Sin as u32),
+                    Operand::IdRef(scaled),
+                ],
+            ),
+            Instruction::new(
+                Op::ExtInst,
+                Some(rty),
+                Some(cos),
+                vec![
+                    Operand::IdRef(ext),
+                    Operand::LiteralExtInstInteger(GLSLstd450::Cos as u32),
+                    Operand::IdRef(scaled),
+                ],
+            ),
+            Instruction::new(
+                Op::FDiv,
+                Some(rty),
+                Some(res),
+                vec![Operand::IdRef(sin), Operand::IdRef(cos)],
+            ),
+        ]);
+    }
+    if name.starts_with("air.cospi.") && args.len() == 1 {
         return lower_metal_pi_scaled_sin_cos(ctx, res, rty, args[0], PiScaled::Cos);
     }
-    if (name.starts_with("air.sinpi.") || name.starts_with("air.fast_sinpi.")) && args.len() == 1 {
+    if name.starts_with("air.sinpi.") && args.len() == 1 {
         return lower_metal_pi_scaled_sin_cos(ctx, res, rty, args[0], PiScaled::Sin);
     }
-    if (name.starts_with("air.tanpi.") || name.starts_with("air.fast_tanpi.")) && args.len() == 1 {
+    if name.starts_with("air.tanpi.") && args.len() == 1 {
         return lower_metal_pi_scaled_sin_cos(ctx, res, rty, args[0], PiScaled::Tan);
     }
     if (name.starts_with("air.exp10.") || name.starts_with("air.fast_exp10.")) && args.len() == 1 {
         let ext = ctx.glsl();
         let n = vector_len(ctx, rty);
+        if ctx.nvidia_fast_target {
+            let log2_10 = splat_or_scalar(ctx, rty, std::f32::consts::LOG2_10, n);
+            let scaled = ctx.module.fresh_id();
+            return Ok(vec![
+                Instruction::new(
+                    Op::FMul,
+                    Some(rty),
+                    Some(scaled),
+                    vec![Operand::IdRef(args[0]), Operand::IdRef(log2_10)],
+                ),
+                Instruction::new(
+                    Op::ExtInst,
+                    Some(rty),
+                    Some(res),
+                    vec![
+                        Operand::IdRef(ext),
+                        Operand::LiteralExtInstInteger(GLSLstd450::Exp2 as u32),
+                        Operand::IdRef(scaled),
+                    ],
+                ),
+            ]);
+        }
         let ten = splat_or_scalar(ctx, rty, 10.0, n);
         return Ok(vec![Instruction::new(
             Op::ExtInst,
@@ -613,6 +725,8 @@ pub(in crate::passes) fn lower_float_math(
     if let Some(glsl_op) = glsl_extinst(name) {
         if args.len() == 1
             && glsl_op == GLSLstd450::Round
+            && !(ctx.nvidia_fast_target
+                && (name.starts_with("air.fast_") || name.starts_with("air.native_")))
             && (is_f32_scalar_or_vector(ctx, rty) || is_half_scalar_or_vector(ctx, rty))
         {
             return Ok(lower_metal_round(ctx, res, rty, args[0]));

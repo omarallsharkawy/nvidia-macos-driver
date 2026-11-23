@@ -8856,3 +8856,57 @@ fn native_null_resource_id_reads_the_typed_dummy_slot_only_when_the_plugin_reser
     }
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn native_fragment_pixel_linear_clamp_to_edge_uses_hw_explicit_lod0() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+define <4 x float> @frag(<4 x float> %position, <2 x float> %coord, ptr addrspace(1) %tex, ptr addrspace(2) %sampler) {
+entry:
+  %sample = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, <2 x float> %coord, i1 true, <2 x i32> <i32 1, i32 -1>, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %color = extractvalue { <4 x float>, i8 } %sample, 0
+  ret <4 x float> %color
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!3 = !{!4, !5, !6, !7}
+!4 = !{i32 0, !"air.position", !"air.center", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
+!5 = !{i32 1, !"air.fragment_input", !"generated(coord)", !"air.center", !"air.perspective", !"air.arg_type_name", !"float2", !"air.arg_name", !"coord"}
+!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex"}
+!7 = !{i32 3, !"air.sampler", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"sampler"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_fragment_pixel_linear_hw_lod0_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let state = runtime_sampler_state(
+        crate::reflect::SamplerCoordinates::Pixel,
+        crate::reflect::SamplerFilter::Linear,
+        crate::reflect::SamplerAddressMode::ClampToEdge,
+    );
+    let options = passes::TransformOptions::default()
+        .with_runtime_sampler(0, state)
+        .unwrap();
+    let spv = crate::translate_sanitized_native_with_options(ll, Stage::Fragment, &tmp, options)
+        .expect("fragment pixel linear translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpImageSampleExplicitLod"), "{asm}");
+    assert!(asm.contains("ConstOffset"), "{asm}");
+    assert!(!asm.contains("OpImageSampleImplicitLod"), "{asm}");
+    assert!(!asm.contains("OpImageFetch"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}

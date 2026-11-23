@@ -1035,6 +1035,20 @@ fn lower_simd_vote(
     if !is_bool_type(ctx, rty) {
         return Err("simd vote result type is not bool".to_string());
     }
+    if ctx.nvidia_fast_target {
+        let scope = ctx.const_uint(Scope::Subgroup as u32);
+        let op = if all {
+            Op::GroupNonUniformAll
+        } else {
+            Op::GroupNonUniformAny
+        };
+        return Ok(vec![Instruction::new(
+            op,
+            Some(rty),
+            Some(res),
+            vec![Operand::IdScope(scope), Operand::IdRef(predicate)],
+        )]);
+    }
     let mut insts = Vec::new();
     let lane = subgroup_lane_index_u32(ctx, &mut insts);
     let voted = subgroup_partition_ballot_word(ctx, &mut insts, lane, predicate);
@@ -1069,6 +1083,45 @@ fn lower_simd_ballot(
     let width = int_scalar_width(ctx, rty);
     if width != Some(64) && width != Some(32) {
         return Err("air.simd_ballot result is not i64 or i32".to_string());
+    }
+    if ctx.nvidia_fast_target {
+        let uint = ctx.ty_uint();
+        let ballot_ty = ctx.ty_vec_uint(4);
+        let scope = ctx.const_uint(Scope::Subgroup as u32);
+        let ballot = ctx.module.fresh_id();
+        let mut insts = vec![Instruction::new(
+            Op::GroupNonUniformBallot,
+            Some(ballot_ty),
+            Some(ballot),
+            vec![Operand::IdScope(scope), Operand::IdRef(predicate)],
+        )];
+        if width == Some(32) && rty == uint {
+            insts.push(Instruction::new(
+                Op::CompositeExtract,
+                Some(uint),
+                Some(res),
+                vec![Operand::IdRef(ballot), Operand::LiteralBit32(0)],
+            ));
+        } else {
+            let word = ctx.module.fresh_id();
+            insts.push(Instruction::new(
+                Op::CompositeExtract,
+                Some(uint),
+                Some(word),
+                vec![Operand::IdRef(ballot), Operand::LiteralBit32(0)],
+            ));
+            insts.push(Instruction::new(
+                if width == Some(32) {
+                    Op::Bitcast
+                } else {
+                    Op::UConvert
+                },
+                Some(rty),
+                Some(res),
+                vec![Operand::IdRef(word)],
+            ));
+        }
+        return Ok(insts);
     }
     let mut insts = Vec::new();
     let lane = subgroup_lane_index_u32(ctx, &mut insts);
@@ -1175,6 +1228,15 @@ pub(in crate::passes) fn lower_simd_op(
         if !is_bool_type(ctx, rty) {
             return Err(format!("{name} result type is not bool"));
         }
+        if ctx.nvidia_fast_target {
+            let scope = ctx.const_uint(Scope::Subgroup as u32);
+            return Ok(Some(vec![Instruction::new(
+                Op::GroupNonUniformElect,
+                Some(rty),
+                Some(res),
+                vec![Operand::IdScope(scope)],
+            )]));
+        }
         let mut insts = Vec::new();
         let lane = subgroup_lane_index_u32(ctx, &mut insts);
         let first = metal_simd_first_active_lane_u32(ctx, lane, &mut insts);
@@ -1188,6 +1250,14 @@ pub(in crate::passes) fn lower_simd_op(
     }
     if name.starts_with("air.simd_broadcast_first.") && args.len() == 1 {
         let scope = ctx.const_uint(Scope::Subgroup as u32);
+        if ctx.nvidia_fast_target {
+            return Ok(Some(vec![Instruction::new(
+                Op::GroupNonUniformBroadcastFirst,
+                Some(rty),
+                Some(res),
+                vec![Operand::IdScope(scope), Operand::IdRef(args[0])],
+            )]));
+        }
         let mut insts = Vec::new();
         let lane = subgroup_lane_index_u32(ctx, &mut insts);
         let first = metal_simd_first_active_lane_u32(ctx, lane, &mut insts);

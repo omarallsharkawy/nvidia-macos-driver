@@ -14,12 +14,12 @@ impl Emitter {
         }
         if raw.device_addr_base.is_some() {
             let ty = self.resolve_type(ty)?;
-            return self.emit_device_addr_load(result, &ty, raw, instructions);
+            return self.emit_device_addr_load(result, &ty, raw, access_align, instructions);
         }
         self.emit_raw_load_at(result, ty, raw, 0, access_align, instructions)
     }
 
-    fn wide_word_load_hint(
+    pub(in crate::native::emitter) fn wide_word_load_hint(
         &self,
         raw: &RawBufferOffset,
         extra: u64,
@@ -52,7 +52,92 @@ impl Emitter {
         match self.resolve_type(ty)? {
             LlType::Vector(elem, lanes) => {
                 let elem = self.resolve_type(&elem)?;
-                if matches!(elem, LlType::Half)
+                if matches!(elem, LlType::Int(8))
+                    && lanes >= 4
+                    && lanes % 4 == 0
+                    && self.raw_byte_array_root_len(raw).is_none()
+                    && self.raw_word_access_can_use_word_index(raw, extra, access_align)
+                    && std::env::var_os("NVMTL_NO_HALF_WORDS").is_none()
+                {
+                    let words = lanes / 4;
+                    let first = self.emit_raw_word_index_for_access(
+                        raw,
+                        extra,
+                        access_align,
+                        instructions,
+                    )?;
+                    let quad_ty = self.type_id(&LlType::Vector(Box::new(LlType::Int(8)), 4))?;
+                    let byte_ty = self.type_id(&LlType::Int(8))?;
+                    if lanes == 4 {
+                        let word = self.emit_raw_word_load_at_index(raw, first, instructions)?;
+                        instructions.push(Self::inst(
+                            Op::Bitcast,
+                            Some(quad_ty),
+                            Some(result),
+                            vec![Operand::IdRef(word)],
+                        ));
+                        return Ok(());
+                    }
+                    let mut lane_ids = Vec::with_capacity(lanes as usize);
+                    for chunk in 0..words {
+                        let index = if chunk == 0 {
+                            first
+                        } else {
+                            self.emit_raw_word_index_for_access(
+                                raw,
+                                extra + 4 * u64::from(chunk),
+                                access_align,
+                                instructions,
+                            )?
+                        };
+                        let word = self.emit_raw_word_load_at_index(raw, index, instructions)?;
+                        if chunk % 2 == 0 && chunk + 1 < words {
+                            if let Some(align) = self.wide_word_load_hint(
+                                raw,
+                                extra + 4 * u64::from(chunk),
+                                access_align,
+                            ) {
+                                if let Some(load) = instructions.last_mut().filter(|i| {
+                                    i.class.opcode == Op::Load
+                                        && i.result_id == Some(word)
+                                        && i.operands.len() == 1
+                                }) {
+                                    load.operands.extend([
+                                        Operand::MemoryAccess(spirv::MemoryAccess::ALIGNED),
+                                        Operand::LiteralBit32(align),
+                                    ]);
+                                }
+                            }
+                        }
+                        let quad = self.fresh();
+                        instructions.push(Self::inst(
+                            Op::Bitcast,
+                            Some(quad_ty),
+                            Some(quad),
+                            vec![Operand::IdRef(word)],
+                        ));
+                        for slot in 0..4u32 {
+                            let id = self.fresh();
+                            instructions.push(Self::inst(
+                                Op::CompositeExtract,
+                                Some(byte_ty),
+                                Some(id),
+                                vec![Operand::IdRef(quad), Operand::LiteralBit32(slot)],
+                            ));
+                            lane_ids.push(id);
+                        }
+                    }
+                    let result_type = self.type_id(&LlType::Vector(Box::new(elem), lanes))?;
+                    instructions.push(Self::inst(
+                        Op::CompositeConstruct,
+                        Some(result_type),
+                        Some(result),
+                        lane_ids.into_iter().map(Operand::IdRef).collect(),
+                    ));
+                    return Ok(());
+                }
+                if matches!(elem, LlType::Half | LlType::Int(16) | LlType::BFloat)
+                    && lanes >= 2
                     && lanes % 2 == 0
                     && self.raw_byte_array_root_len(raw).is_none()
                     && self.raw_word_access_can_use_word_index(raw, extra, access_align)
@@ -64,8 +149,19 @@ impl Emitter {
                         access_align,
                         instructions,
                     )?;
-                    let pair_ty = self.type_id(&LlType::Vector(Box::new(LlType::Half), 2))?;
-                    let half_ty = self.type_id(&LlType::Half)?;
+                    let pair_ty =
+                        self.type_id(&LlType::Vector(Box::new(elem.clone()), 2))?;
+                    let elem_ty = self.type_id(&elem)?;
+                    if lanes == 2 {
+                        let word = self.emit_raw_word_load_at_index(raw, first, instructions)?;
+                        instructions.push(Self::inst(
+                            Op::Bitcast,
+                            Some(pair_ty),
+                            Some(result),
+                            vec![Operand::IdRef(word)],
+                        ));
+                        return Ok(());
+                    }
                     let mut lane_ids = Vec::with_capacity(lanes as usize);
                     for pair in 0..lanes / 2 {
                         let index = if pair == 0 {
@@ -79,7 +175,7 @@ impl Emitter {
                             )?
                         };
                         let word = self.emit_raw_word_load_at_index(raw, index, instructions)?;
-                        if pair + 1 < lanes / 2 {
+                        if pair % 2 == 0 && pair + 1 < lanes / 2 {
                             if let Some(align) = self.wide_word_load_hint(
                                 raw,
                                 extra + 4 * u64::from(pair),
@@ -108,7 +204,7 @@ impl Emitter {
                             let id = self.fresh();
                             instructions.push(Self::inst(
                                 Op::CompositeExtract,
-                                Some(half_ty),
+                                Some(elem_ty),
                                 Some(id),
                                 vec![Operand::IdRef(both), Operand::LiteralBit32(slot)],
                             ));
@@ -325,11 +421,24 @@ impl Emitter {
         }
     }
 
+    pub(in crate::native::emitter) fn device_addr_access_align(
+        &mut self,
+        ty: &LlType,
+        access_align: Option<u64>,
+    ) -> u32 {
+        let natural = self.device_addr_align(ty);
+        match access_align {
+            Some(a) if a > 0 && a.is_power_of_two() => a.min(16) as u32,
+            _ => natural,
+        }
+    }
+
     pub(in crate::native::emitter) fn emit_device_addr_load(
         &mut self,
         result: Word,
         ty: &LlType,
         raw: &RawBufferOffset,
+        access_align: Option<u64>,
         instructions: &mut Vec<Instruction>,
     ) -> Result<(), String> {
         self.used_device_address = true;
@@ -338,7 +447,8 @@ impl Emitter {
             .device_addr_base
             .ok_or("native emitter: device load has no base")?;
         let result_ty = self.type_id(ty)?;
-        let helper = self.null_bda_load_helper(ty)?;
+        let align = self.device_addr_access_align(ty, access_align);
+        let helper = self.null_bda_load_helper(ty, align)?;
         instructions.push(Self::inst(
             Op::FunctionCall,
             Some(result_ty),
@@ -352,8 +462,8 @@ impl Emitter {
         Ok(())
     }
 
-    fn null_bda_load_helper(&mut self, ty: &LlType) -> Result<Word, String> {
-        let key = (ty.clone(), self.constant_space_load);
+    fn null_bda_load_helper(&mut self, ty: &LlType, align: u32) -> Result<Word, String> {
+        let key = (ty.clone(), self.constant_space_load, align);
         if let Some(helper) = self.null_bda_load_helpers.get(&key) {
             return Ok(*helper);
         }
@@ -431,7 +541,6 @@ impl Emitter {
                 p
             }
         };
-        let align = self.device_addr_align(ty);
         instructions.push(Self::inst(
             Op::Load,
             Some(result_ty),
@@ -574,6 +683,7 @@ impl Emitter {
         ty: &LlType,
         value: Word,
         raw: &RawBufferOffset,
+        access_align: Option<u64>,
         instructions: &mut Vec<Instruction>,
     ) -> Result<(), String> {
         self.used_device_address = true;
@@ -586,7 +696,7 @@ impl Emitter {
             Some(p),
             vec![Operand::IdRef(addr)],
         ));
-        let align = self.device_addr_align(ty);
+        let align = self.device_addr_access_align(ty, access_align);
         instructions.push(Self::inst(
             Op::Store,
             None,
