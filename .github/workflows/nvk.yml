@@ -69,7 +69,7 @@ jobs:
           export LIBCLANG_PATH="$LLVM_PREFIX/lib"
           export NVK_SYSROOT="$GITHUB_WORKSPACE/sysroot"
           export BINDGEN_EXTRA_CLANG_ARGS="-isysroot $SDK"
-          export NVK_EXTRA_PATCHES="nvk-loq-ada-perf"
+          export NVK_EXTRA_PATCHES="nvk-upstream-nak nvk-loq-ada-perf"
           export NVK_JOBS=4
           if ! bash build/build_nvk.sh "$GITHUB_WORKSPACE/mesa" "$GITHUB_WORKSPACE/ogkm-610" "$GITHUB_WORKSPACE/out" 3.0; then
             for l in clc-native.setup.log clc-native.log setup.log build.log; do

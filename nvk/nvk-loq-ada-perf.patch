@@ -1,114 +1,35 @@
---- a/src/nouveau/compiler/nak_nir.c
-+++ b/src/nouveau/compiler/nak_nir.c
-@@ -2819,7 +2819,7 @@
- 
-    /* Small per-thread arrays (up to 16 elements by default, NAK_B83_ARRAYS=8|16|32 to change, NVMTL_NO_SMALL_ARRAYS
-     * to turn off) are lowered to if-else trees so they live in registers rather than local memory. */
--   if (nak->sm == 120 && nir->info.stage == MESA_SHADER_COMPUTE) {
-+   if (nak->sm >= 80 && nir->info.stage == MESA_SHADER_COMPUTE) {
-       const unsigned limit = nvmtl_small_array_limit(getenv("NAK_B83_ARRAYS"));
-       if (limit) {
-          const bool lowered = OPT(nir, nir_lower_indirect_derefs_to_if_else_trees,   /* 26.3 name */
---- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
-+++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
-@@ -48,6 +48,9 @@
-     * boostRenewNs is the monotonic time before which a submit does not ask again. */
-    int boostMode;
-    uint64_t boostRenewNs;
-+   bool boostActive;
-+   uint64_t boostAcCheckNs;
-+   int boostAcCached;
- 
-    uint32_t numClasses;
-    uint32_t *classList;
---- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_pdev.c
-+++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_pdev.c
-@@ -16,6 +16,8 @@
- #include "vk_log.h"
- 
- #include <string.h>
-+#include <sys/types.h>
-+#include <sys/sysctl.h>
- 
- #include "class/cl0080.h" // NV01_DEVICE_0
- #include "class/cl2080.h" // NV20_SUBDEVICE_0
-@@ -809,6 +811,41 @@
- #define NVKMD_NVRM_BOOST_LEASE_S   3
- #define NVKMD_NVRM_BOOST_RENEW_NS  1000000000ull
- 
-+static bool
-+nvkmd_nvrm_on_battery(struct nvkmd_nvrm_pdev *pdev, uint64_t now)
-+{
-+   /* boostAcCached: 0 = uninit (treat as AC), 1 = battery, 2 = AC, 3 = NVRM_610_BOOST_BATT=1 override. */
-+   int cached = __atomic_load_n(&pdev->boostAcCached, __ATOMIC_RELAXED);
-+   if (cached == 3)
-+      return false;
-+
-+   uint64_t due = __atomic_load_n(&pdev->boostAcCheckNs, __ATOMIC_RELAXED);
-+   if (due == 0 || now >= due) {
-+      /* Poll power source at most once every 2s across threads; check BOOST_BATT once per pdev. */
-+      const uint64_t next = now + 2000000000ull;
-+      if (__atomic_compare_exchange_n(&pdev->boostAcCheckNs, &due, next ? next : 1ull, false,
-+                                      __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
-+         if (cached == 0) {
-+            const int ov = nvrm610_value("BOOST_BATT");
-+            if (ov == '1' || ov == 'y' || ov == 'Y') {
-+               __atomic_store_n(&pdev->boostAcCached, 3, __ATOMIC_RELAXED);
-+               return false;
-+            }
-+         }
-+         int ac = -1;
-+         size_t sz = sizeof ac;
-+         if (sysctlbyname("debug.nvrm_tgp_ac", &ac, &sz, NULL, 0) != 0 || (ac != 0 && ac != 1)) {
-+            sz = sizeof ac;
-+            if (sysctlbyname("debug.hwpfix_ac", &ac, &sz, NULL, 0) != 0 || (ac != 0 && ac != 1))
-+               ac = 1;
-+         }
-+         __atomic_store_n(&pdev->boostAcCached, ac ? 2 : 1, __ATOMIC_RELAXED);
-+      }
-+      cached = __atomic_load_n(&pdev->boostAcCached, __ATOMIC_RELAXED);
-+   }
-+   return cached == 1;
-+}
-+
- void
- nvkmd_nvrm_boost_burst(struct nvkmd_nvrm_pdev *pdev)
- {
-@@ -816,6 +853,20 @@
-       return;
- 
-    const uint64_t now = os_time_get_nano();
-+   if (nvkmd_nvrm_on_battery(pdev, now)) {
-+      if (__atomic_exchange_n(&pdev->boostActive, false, __ATOMIC_RELAXED)) {
-+         struct NvRmApi rm;
-+         nvkmd_nvrm_dev_api_ctl(pdev, &rm);
-+         NV2080_CTRL_PERF_BOOST_PARAMS bp = {
-+            .flags = NV2080_CTRL_PERF_BOOST_FLAGS_CMD_CLEAR,
-+            .duration = 0,
-+         };
-+         nvRmApiControl(&rm, pdev->hSubdevice, NV2080_CTRL_CMD_PERF_BOOST, &bp, sizeof bp);
-+         __atomic_store_n(&pdev->boostRenewNs, 0, __ATOMIC_RELAXED);
-+      }
-+      return;
-+   }
-+
-    uint64_t due = __atomic_load_n(&pdev->boostRenewNs, __ATOMIC_RELAXED);
-    if (now < due)
-       return;
-@@ -831,7 +882,9 @@
-       .duration = NVKMD_NVRM_BOOST_LEASE_S,
-    };
-    NV_STATUS bs = nvRmApiControl(&rm, pdev->hSubdevice, NV2080_CTRL_CMD_PERF_BOOST, &bp, sizeof bp);
--   if (bs != NV_OK) {
-+   if (bs == NV_OK) {
-+      __atomic_store_n(&pdev->boostActive, true, __ATOMIC_RELAXED);
-+   } else {
-       /* Not supported here: stop asking rather than fail every second. */
-       __atomic_store_n(&pdev->boostMode, NVKMD_NVRM_BOOST_OFF, __ATOMIC_RELAXED);
-       if (nvkmd_nvrm_diag_on())
-diff -ruN a/src/nouveau/compiler/nak/qmd.rs b/src/nouveau/compiler/nak/qmd.rs
---- a/src/nouveau/compiler/nak/qmd.rs	2026-11-22 16:55:40
-+++ b/src/nouveau/compiler/nak/qmd.rs	2026-11-22 16:57:15
+--- a/src/nouveau/compiler/nak/from_nir.rs
++++ b/src/nouveau/compiler/nak/from_nir.rs
+@@ -3938,10 +3938,26 @@
+                 let size_B =
+                     (srcs[0].bit_size() / 8) * srcs[0].num_components();
+                 assert!(u32::from(size_B) <= intrin.align());
++                // speed267: a plain store is weak (STG.E), as NVIDIA's own compiler emits it; coherent/volatile stay
++                // strong.gpu. Measured 11-01 on GB7's particle with Shared (system-RAM) buffers: strong.gpu stores
++                // cost ~70-100 ns per threadgroup (an empty kernel: 317 us vs 5.6 us with the buffer in VRAM).
++                // Visibility across dispatches comes from the barriers between them, not from the store's order.
++                // NVMTL_NAK_STRONG_STORES=1 restores strong.gpu everywhere.
++                static STRONG_STORES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++                let strong_stores = *STRONG_STORES.get_or_init(|| {
++                    std::env::var_os("NVMTL_NAK_STRONG_STORES").is_some_and(|v| v != "0")
++                });
++                let store_order = if !strong_stores
++                    && (intrin.access() & (ACCESS_COHERENT | ACCESS_VOLATILE)) == 0
++                {
++                    MemOrder::Weak
++                } else {
++                    MemOrder::Strong(MemScope::GPU)
++                };
+                 let access = MemAccess {
+                     mem_type: MemType::from_size(size_B, false),
+                     space: MemSpace::Global(MemAddrType::A64),
+-                    order: MemOrder::Strong(MemScope::GPU),
++                    order: store_order,
+                     eviction_priority: self
+                         .get_eviction_priority(intrin.access()),
+                 };
+--- a/src/nouveau/compiler/nak/qmd.rs
++++ b/src/nouveau/compiler/nak/qmd.rs
 @@ -755,6 +755,23 @@
              DEPENDENT_QMD0_POINTER
          );
@@ -133,9 +54,19 @@ diff -ruN a/src/nouveau/compiler/nak/qmd.rs b/src/nouveau/compiler/nak/qmd.rs
      }
  }
  use qmd_3_0::Qmd3_0;
-diff -ruN a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
---- a/src/nouveau/vulkan/nvk_cmd_buffer.h	2026-11-22 16:55:40
-+++ b/src/nouveau/vulkan/nvk_cmd_buffer.h	2026-11-22 16:57:17
+--- a/src/nouveau/compiler/nak_nir.c
++++ b/src/nouveau/compiler/nak_nir.c
+@@ -2819,7 +2819,7 @@
+ 
+    /* Small per-thread arrays (up to 16 elements by default, NAK_B83_ARRAYS=8|16|32 to change, NVMTL_NO_SMALL_ARRAYS
+     * to turn off) are lowered to if-else trees so they live in registers rather than local memory. */
+-   if (nak->sm == 120 && nir->info.stage == MESA_SHADER_COMPUTE) {
++   if (nak->sm >= 80 && nir->info.stage == MESA_SHADER_COMPUTE) {
+       const unsigned limit = nvmtl_small_array_limit(getenv("NAK_B83_ARRAYS"));
+       if (limit) {
+          const bool lowered = OPT(nir, nir_lower_indirect_derefs_to_if_else_trees,   /* 26.3 name */
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
 @@ -262,6 +262,7 @@
     bool stats;       /* NVMTL_GDQ_STATS=1: barrier/chain counts to stderr at exit */
     bool res;         /* NVMTL_GDQ_RES=1: k7 resident successors released by DECREMENT_DEPENDENCE */
@@ -144,9 +75,8 @@ diff -ruN a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buf
  };
  
  struct nvk_video_state {
-diff -ruN a/src/nouveau/vulkan/nvk_cmd_dispatch.c b/src/nouveau/vulkan/nvk_cmd_dispatch.c
---- a/src/nouveau/vulkan/nvk_cmd_dispatch.c	2026-11-22 16:55:40
-+++ b/src/nouveau/vulkan/nvk_cmd_dispatch.c	2026-11-22 16:58:01
+--- a/src/nouveau/vulkan/nvk_cmd_dispatch.c
++++ b/src/nouveau/vulkan/nvk_cmd_dispatch.c
 @@ -355,6 +355,7 @@
        c.stats = (s = nvmtl_cfg_getenv("NVMTL_GDQ_STATS")) && atoi(s);
        c.res = (s = nvmtl_cfg_getenv("NVMTL_GDQ_RES")) && atoi(s);
@@ -307,3 +237,401 @@ diff -ruN a/src/nouveau/vulkan/nvk_cmd_dispatch.c b/src/nouveau/vulkan/nvk_cmd_d
     cs->gdq_push_start = cmd->push.start;
     cs->gdq_push_after_disp = cmd->push.end;
     cs->gdq_last_hdr = cmd->push.last_hdr;
+--- a/src/nouveau/vulkan/nvk_device_memory.c
++++ b/src/nouveau/vulkan/nvk_device_memory.c
+@@ -79,8 +79,14 @@
+     * imported memory stays volatile: another process or device reaches it outside our submissions.
+     * NVK_SYSMEM_GPU_UNCACHED=1 restores the volatile mapping everywhere (the speed control). */
+    else {
+-      const char *e = nvmtl_cfg_getenv("NVK_SYSMEM_GPU_UNCACHED");
+-      if (!(e && e[0] == '1'))
++      static int sysmem_uncached = -1;
++      int uc = __atomic_load_n(&sysmem_uncached, __ATOMIC_RELAXED);
++      if (uc < 0) {
++         const char *e = nvmtl_cfg_getenv("NVK_SYSMEM_GPU_UNCACHED");
++         uc = (e && e[0] == '1') ? 1 : 0;
++         __atomic_store_n(&sysmem_uncached, uc, __ATOMIC_RELAXED);
++      }
++      if (!uc)
+          flags |= NVK69_MEM_GPU_CACHED;
+    }
+ 
+@@ -88,8 +94,14 @@
+     * BAR1. Exported/imported memory keeps the old GART placement. NVK_BAR_VRAM=0 restores it everywhere. */
+    if ((type->propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+        (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && handle_types == 0) {
+-      const char *e = nvmtl_cfg_getenv("NVK_BAR_VRAM");
+-      if (!(e && e[0] == '0'))
++      static int bar_vram = -1;
++      int bv = __atomic_load_n(&bar_vram, __ATOMIC_RELAXED);
++      if (bv < 0) {
++         const char *e = nvmtl_cfg_getenv("NVK_BAR_VRAM");
++         bv = (e && e[0] == '0') ? 0 : 1;
++         __atomic_store_n(&bar_vram, bv, __ATOMIC_RELAXED);
++      }
++      if (bv)
+          flags |= NVKMD_MEM_BAR;
+    }
+ 
+--- a/src/nouveau/vulkan/nvk_shader.c
++++ b/src/nouveau/vulkan/nvk_shader.c
+@@ -448,9 +448,14 @@
+       /* Needs to run before load_const_to_scalar.
+        * NVMTL b79 u4: threshold 16, not 32 -- a non-small 17..32 B table (canny's int[8] offsets) went to scratch.
+        * NVMTL_NVK_NO_LCONST16=1 restores 32 (the kill switch; not in the shader cache key, so run it cache-off). */
+-      const char *lc = nvmtl_cfg_getenv("NVMTL_NVK_NO_LCONST16");
+-      NIR_PASS(_, nir, nir_opt_large_constants, NULL,
+-               (lc != NULL && lc[0] == '1') ? 32 : 16);
++      static int no_lconst16 = -1;
++      int nlc = __atomic_load_n(&no_lconst16, __ATOMIC_RELAXED);
++      if (nlc < 0) {
++         const char *lc = nvmtl_cfg_getenv("NVMTL_NVK_NO_LCONST16");
++         nlc = (lc != NULL && lc[0] == '1') ? 1 : 0;
++         __atomic_store_n(&no_lconst16, nlc, __ATOMIC_RELAXED);
++      }
++      NIR_PASS(_, nir, nir_opt_large_constants, NULL, nlc ? 32 : 16);
+    } else {
+       *cbuf_map_out = (struct nvk_cbuf_map) {
+          .cbuf_count = 1,
+@@ -723,6 +728,20 @@
+    return total_size;
+ }
+ 
++static char nvk_dump_shader_dir_buf[384];
++static bool nvk_dump_shader_dir_on;
++static pthread_once_t nvk_dump_shader_dir_once = PTHREAD_ONCE_INIT;
++
++static void
++nvk_dump_shader_dir_init(void)
++{
++   const char *dir = nvmtl_cfg_getenv("NVK_DUMP_SHADER_DIR");
++   if (dir && dir[0]) {
++      snprintf(nvk_dump_shader_dir_buf, sizeof nvk_dump_shader_dir_buf, "%s", dir);
++      nvk_dump_shader_dir_on = true;
++   }
++}
++
+ static VkResult
+ nvk_shader_upload(struct nvk_device *dev, struct nvk_shader *shader)
+ {
+@@ -758,9 +777,21 @@
+    if (has_mesh_gs_sph)
+       memcpy(data + gs_hdr_offset, shader->info.mesh.gs_hdr, hdr_size);
+    {  // instrument: dump the exact code bytes for nvdisasm -b SM120 on the test machine
+-      const char *dir = nvmtl_cfg_getenv("NVK_DUMP_SHADER_DIR");
+-      if (dir) { static int n; char path[512]; snprintf(path, sizeof path, "%s/%s_%d.bin", dir, _mesa_shader_stage_to_string(shader->info.stage), n++);
+-         FILE *f = fopen(path, "wb"); if (f) { fwrite(shader->code_ptr, 1, shader->code_size, f); fclose(f); fprintf(stderr, "nvk: wrote %s (%u B, hdr_offset %u code_offset %u)\n", path, shader->code_size, (unsigned)hdr_offset, (unsigned)code_offset); } }
++      pthread_once(&nvk_dump_shader_dir_once, nvk_dump_shader_dir_init);
++      if (nvk_dump_shader_dir_on) {
++         static int n;
++         const int idx = __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED);
++         char path[512];
++         snprintf(path, sizeof path, "%s/%s_%d.bin", nvk_dump_shader_dir_buf,
++                  _mesa_shader_stage_to_string(shader->info.stage), idx);
++         FILE *f = fopen(path, "wb");
++         if (f) {
++            fwrite(shader->code_ptr, 1, shader->code_size, f);
++            fclose(f);
++            fprintf(stderr, "nvk: wrote %s (%u B, hdr_offset %u code_offset %u)\n",
++                    path, shader->code_size, (unsigned)hdr_offset, (unsigned)code_offset);
++         }
++      }
+    }
+    if (shader->data_size > 0)
+       memcpy(data + data_offset, shader->data_ptr, shader->data_size);
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm.h
+@@ -48,6 +48,9 @@
+     * boostRenewNs is the monotonic time before which a submit does not ask again. */
+    int boostMode;
+    uint64_t boostRenewNs;
++   bool boostActive;
++   uint64_t boostAcCheckNs;
++   int boostAcCached;
+ 
+    uint32_t numClasses;
+    uint32_t *classList;
+@@ -73,6 +76,7 @@
+ struct nvkmd_nvrm_dev {
+    struct nvkmd_dev base;
+    struct hash_table *mappings;
++   simple_mtx_t mappings_mutex;
+    /* b73 ONE graphics non-stall event per device (patch_evdev.py): engine-wide in RM, so per-channel events only
+     * multiplied RM's per-interrupt list walk. Waits sleep on osEvent (kext selector 6). -1 / 0 = none. */
+    int osEvent;
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_dev.c
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_dev.c
+@@ -35,6 +35,7 @@
+     * list here); a zeroed list head made the first allocation write through NULL+8 in nvk_upload_queue_init. */
+    list_inithead(&dev->base.mems);
+    simple_mtx_init(&dev->base.mems_mutex, mtx_plain);
++   simple_mtx_init(&dev->mappings_mutex, mtx_plain);
+ 
+    dev->mappings = _mesa_hash_table_create(NULL, _mesa_hash_pointer, _mesa_key_pointer_equal);
+    if (dev->mappings == NULL) {
+@@ -84,6 +85,7 @@
+ 
+    if (dev->mappings != NULL)
+       _mesa_hash_table_destroy(dev->mappings, NULL);
++   simple_mtx_destroy(&dev->mappings_mutex);
+ 
+    if (dev->hEvent != 0) {   /* b73 device event */
+       struct NvRmApi rm;
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_mem.c
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_mem.c
+@@ -450,7 +450,10 @@
+                        (unsigned long long)mem->base.size_B, mem->isSystemMem ? "system" : "vidmem", nvRes);
+    }
+ 
+-   if (_mesa_hash_table_insert(dev->mappings, mapping->address, mapping) == NULL) {
++   simple_mtx_lock(&dev->mappings_mutex);
++   struct hash_entry *ent = _mesa_hash_table_insert(dev->mappings, mapping->address, mapping);
++   simple_mtx_unlock(&dev->mappings_mutex);
++   if (ent == NULL) {
+    	nvRmApiUnmapMemory(&rm, pdev->hSubdevice, mem->hMemoryPhys, 0, mapping);
+       free(mapping);
+       return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
+@@ -475,23 +478,29 @@
+    if (mem->hostPtr)
+       return;   /* b72 host-pointer import: the caller's pages were never mapped by us */
+ 
++   simple_mtx_lock(&dev->mappings_mutex);
+    struct hash_entry *ent = _mesa_hash_table_search(dev->mappings, map);
+-   if (ent == NULL) {
++   NvRmApiMapping *mapping = NULL;
++   if (ent != NULL) {
++      mapping = ent->data;
++      /* Drop the table's reference before unmapping/freeing: a later lookup of the same
++       * address would otherwise return this freed mapping and free it again,
++       * corrupting the heap when device creation fails and tears the mappings
++       * down (every process that enumerates Metal devices then aborts in malloc). */
++      _mesa_hash_table_remove(dev->mappings, ent);
++   }
++   simple_mtx_unlock(&dev->mappings_mutex);
++
++   if (mapping == NULL) {
+       fprintf(stderr, "[!] ent == NULL\n");
+       return;
+    }
+-   NvRmApiMapping *mapping = ent->data;
+ 
+    NV_STATUS nvRes = nvRmApiUnmapMemory(&rm, pdev->hSubdevice, mem->hMemoryPhys, 0, mapping);
+    if (nvRes != NV_OK) {
+       fprintf(stderr, "[!] nvRes: %#x\n", nvRes);
+    }
+ 
+-   /* Drop the table's reference before freeing: a later lookup of the same
+-    * address would otherwise return this freed mapping and free it again,
+-    * corrupting the heap when device creation fails and tears the mappings
+-    * down (every process that enumerates Metal devices then aborts in malloc). */
+-   _mesa_hash_table_remove(dev->mappings, ent);
+    free(mapping);
+ }
+ 
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_pdev.c
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_pdev.c
+@@ -16,7 +16,11 @@
+ #include "vk_log.h"
+ 
+ #include <string.h>
++#include <sys/types.h>
++#include <sys/sysctl.h>
+ 
++static bool nvkmd_nvrm_on_battery(struct nvkmd_nvrm_pdev *pdev, uint64_t now);
++
+ #include "class/cl0080.h" // NV01_DEVICE_0
+ #include "class/cl2080.h" // NV20_SUBDEVICE_0
+ #include "class/cl90f1.h" // FERMI_VASPACE_A
+@@ -659,12 +663,18 @@
+       pdev->boostMode = bv == '0' ? NVKMD_NVRM_BOOST_OFF : (bv == 'h' || bv == 'H') ? NVKMD_NVRM_BOOST_HOLD : NVKMD_NVRM_BOOST_BURST;
+    }
+    if (pdev->boostMode == NVKMD_NVRM_BOOST_HOLD) {
+-      NV2080_CTRL_PERF_BOOST_PARAMS bp = {
+-         .flags = NV2080_CTRL_PERF_BOOST_FLAGS_CMD_BOOST_TO_MAX | (NV2080_CTRL_PERF_BOOST_FLAGS_CUDA_YES << 4),   /* 0x12 */
+-         .duration = NV2080_CTRL_PERF_BOOST_DURATION_INFINITE,
+-      };
+-      NV_STATUS bs = nvRmApiControl(&rm, pdev->hSubdevice, NV2080_CTRL_CMD_PERF_BOOST, &bp, sizeof bp);
+-      if (nvkmd_nvrm_diag_on()) fprintf(stderr, "nvrm: PERF_BOOST flags 0x%x INFINITE rc 0x%x\n", (unsigned)bp.flags, (unsigned)bs);
++      if (!nvkmd_nvrm_on_battery(pdev, os_time_get_nano())) {
++         NV2080_CTRL_PERF_BOOST_PARAMS bp = {
++            .flags = NV2080_CTRL_PERF_BOOST_FLAGS_CMD_BOOST_TO_MAX | (NV2080_CTRL_PERF_BOOST_FLAGS_CUDA_YES << 4),   /* 0x12 */
++            .duration = NV2080_CTRL_PERF_BOOST_DURATION_INFINITE,
++         };
++         NV_STATUS bs = nvRmApiControl(&rm, pdev->hSubdevice, NV2080_CTRL_CMD_PERF_BOOST, &bp, sizeof bp);
++         if (bs == NV_OK)
++            __atomic_store_n(&pdev->boostActive, true, __ATOMIC_RELAXED);
++         if (nvkmd_nvrm_diag_on()) fprintf(stderr, "nvrm: PERF_BOOST flags 0x%x INFINITE rc 0x%x\n", (unsigned)bp.flags, (unsigned)bs);
++      } else if (nvkmd_nvrm_diag_on()) {
++         fprintf(stderr, "nvrm: PERF_BOOST hold deferred (on battery)\n");
++      }
+    } else if (nvkmd_nvrm_diag_on()) {
+       fprintf(stderr, "nvrm: PERF_BOOST %s\n", pdev->boostMode == NVKMD_NVRM_BOOST_BURST ? "per burst of work" : "off");
+    }
+@@ -809,13 +819,85 @@
+ #define NVKMD_NVRM_BOOST_LEASE_S   3
+ #define NVKMD_NVRM_BOOST_RENEW_NS  1000000000ull
+ 
++static bool
++nvkmd_nvrm_on_battery(struct nvkmd_nvrm_pdev *pdev, uint64_t now)
++{
++   /* boostAcCached: 0 = uninit (treat as AC), 1 = battery, 2 = AC, 3 = NVRM_610_BOOST_BATT=1 override. */
++   int cached = __atomic_load_n(&pdev->boostAcCached, __ATOMIC_RELAXED);
++   if (cached == 3)
++      return false;
++
++   uint64_t due = __atomic_load_n(&pdev->boostAcCheckNs, __ATOMIC_RELAXED);
++   if (due == 0 || now >= due) {
++      /* Poll power source at most once every 2s across threads; check BOOST_BATT once per pdev. */
++      const uint64_t next = now + 2000000000ull;
++      if (__atomic_compare_exchange_n(&pdev->boostAcCheckNs, &due, next ? next : 1ull, false,
++                                      __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
++         if (cached == 0) {
++            const int ov = nvrm610_value("BOOST_BATT");
++            if (ov == '1' || ov == 'y' || ov == 'Y') {
++               __atomic_store_n(&pdev->boostAcCached, 3, __ATOMIC_RELAXED);
++               return false;
++            }
++         }
++         int ac = -1;
++         size_t sz = sizeof ac;
++         if (sysctlbyname("debug.nvrm_tgp_ac", &ac, &sz, NULL, 0) != 0 || (ac != 0 && ac != 1)) {
++            sz = sizeof ac;
++            if (sysctlbyname("debug.hwpfix_ac", &ac, &sz, NULL, 0) != 0 || (ac != 0 && ac != 1))
++               ac = 1;
++         }
++         __atomic_store_n(&pdev->boostAcCached, ac ? 2 : 1, __ATOMIC_RELAXED);
++      }
++      cached = __atomic_load_n(&pdev->boostAcCached, __ATOMIC_RELAXED);
++   }
++   return cached == 1;
++}
++
+ void
+ nvkmd_nvrm_boost_burst(struct nvkmd_nvrm_pdev *pdev)
+ {
+-   if (pdev->boostMode != NVKMD_NVRM_BOOST_BURST)
++   const int mode = __atomic_load_n(&pdev->boostMode, __ATOMIC_RELAXED);
++   if (mode != NVKMD_NVRM_BOOST_BURST && mode != NVKMD_NVRM_BOOST_HOLD)
+       return;
+ 
+    const uint64_t now = os_time_get_nano();
++   if (nvkmd_nvrm_on_battery(pdev, now)) {
++      if (__atomic_exchange_n(&pdev->boostActive, false, __ATOMIC_RELAXED)) {
++         struct NvRmApi rm;
++         nvkmd_nvrm_dev_api_ctl(pdev, &rm);
++         NV2080_CTRL_PERF_BOOST_PARAMS bp = {
++            .flags = NV2080_CTRL_PERF_BOOST_FLAGS_CMD_CLEAR,
++            .duration = 0,
++         };
++         nvRmApiControl(&rm, pdev->hSubdevice, NV2080_CTRL_CMD_PERF_BOOST, &bp, sizeof bp);
++         __atomic_store_n(&pdev->boostRenewNs, 0, __ATOMIC_RELAXED);
++      }
++      return;
++   }
++
++   if (mode == NVKMD_NVRM_BOOST_HOLD) {
++      if (__atomic_load_n(&pdev->boostActive, __ATOMIC_RELAXED))
++         return;
++      if (__atomic_exchange_n(&pdev->boostActive, true, __ATOMIC_RELAXED))
++         return;
++      struct NvRmApi rm;
++      nvkmd_nvrm_dev_api_ctl(pdev, &rm);
++      NV2080_CTRL_PERF_BOOST_PARAMS bp = {
++         .flags = NV2080_CTRL_PERF_BOOST_FLAGS_CMD_BOOST_TO_MAX |
++                  (NV2080_CTRL_PERF_BOOST_FLAGS_CUDA_YES << 4),   /* 0x12 */
++         .duration = NV2080_CTRL_PERF_BOOST_DURATION_INFINITE,
++      };
++      NV_STATUS bs = nvRmApiControl(&rm, pdev->hSubdevice, NV2080_CTRL_CMD_PERF_BOOST, &bp, sizeof bp);
++      if (bs != NV_OK) {
++         __atomic_store_n(&pdev->boostActive, false, __ATOMIC_RELAXED);
++         __atomic_store_n(&pdev->boostMode, NVKMD_NVRM_BOOST_OFF, __ATOMIC_RELAXED);
++         if (nvkmd_nvrm_diag_on())
++            fprintf(stderr, "nvrm: PERF_BOOST hold refused (rc 0x%x), not asking again\n", (unsigned)bs);
++      }
++      return;
++   }
++
+    uint64_t due = __atomic_load_n(&pdev->boostRenewNs, __ATOMIC_RELAXED);
+    if (now < due)
+       return;
+@@ -831,7 +913,9 @@
+       .duration = NVKMD_NVRM_BOOST_LEASE_S,
+    };
+    NV_STATUS bs = nvRmApiControl(&rm, pdev->hSubdevice, NV2080_CTRL_CMD_PERF_BOOST, &bp, sizeof bp);
+-   if (bs != NV_OK) {
++   if (bs == NV_OK) {
++      __atomic_store_n(&pdev->boostActive, true, __ATOMIC_RELAXED);
++   } else {
+       /* Not supported here: stop asking rather than fail every second. */
+       __atomic_store_n(&pdev->boostMode, NVKMD_NVRM_BOOST_OFF, __ATOMIC_RELAXED);
+       if (nvkmd_nvrm_diag_on())
+--- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_va.c
++++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_va.c
+@@ -111,6 +111,7 @@
+ 			break;
+ 		default:
+ 			fprintf(stderr, "[!] unsupported pte_kind(%#x)\n", pte_kind);
++			FREE(va);
+       /* NVMTL apps-rmreason: the RM status rides back in the VkResult's message, not only on a stderr nobody reads */
+ 			return vk_errorf(log_obj, VK_ERROR_UNKNOWN, "NV50_MEMORY_VIRTUAL: unsupported pte_kind %#x", pte_kind);
+ 	}
+@@ -122,13 +123,13 @@
+       /* NVMTL apps-rmreason: the RM status rides back in the VkResult's message, not only on a stderr nobody reads */
+       return vk_errorf(log_obj, VK_ERROR_UNKNOWN, "nvRmApiAlloc(NV50_MEMORY_VIRTUAL, pte_kind %#x) -> NV_STATUS %#x", pte_kind, nvRes);
+    }
++   va->hMemoryVirt = hMemoryVirt;
+    if (pte_kind != 0 && params.format != pte_kind) {
+       fprintf(stderr, "[!] params.format(%#x) != pte_kind(%#x)\n", params.format, pte_kind);
+       nvkmd_va_free(&va->base);
+       /* NVMTL apps-rmreason: the RM status rides back in the VkResult's message, not only on a stderr nobody reads */
+       return vk_errorf(log_obj, VK_ERROR_UNKNOWN, "NV50_MEMORY_VIRTUAL: RM gave format %#x for pte_kind %#x", params.format, pte_kind);
+    }
+-   va->hMemoryVirt = hMemoryVirt;
+    va->base.addr = params.offset;
+ 
+    *va_out = &va->base;
+--- a/src/nouveau/vulkan/nvmtl_cfg.h
++++ b/src/nouveau/vulkan/nvmtl_cfg.h
+@@ -2,23 +2,33 @@
+  * ("NAME=value" lines) when the env var is unset, so WindowServer (no shell env) can bisect the r3 hang. */
+ #ifndef NVMTL_CFG_H
+ #define NVMTL_CFG_H
++#include <pthread.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++
++static char nvmtl_cfg_conf[8192];
++static pthread_once_t nvmtl_cfg_once = PTHREAD_ONCE_INIT;
++
++static void __attribute__((unused)) nvmtl_cfg_load_once(void)
++{
++   FILE *f = fopen("/Library/GPUBundles/nvmtl/nvrm610.conf", "r");
++   if (f) {
++      size_t n = fread(nvmtl_cfg_conf, 1, sizeof nvmtl_cfg_conf - 1, f);
++      nvmtl_cfg_conf[n] = 0;
++      fclose(f);
++   }
++}
++
+ static inline const char *nvmtl_cfg_getenv(const char *name)
+ {
+    const char *e = getenv(name);
+    if (e) return e;
+-   static char conf[8192]; static int loaded;
+-   if (!loaded) {
+-      loaded = 1;
+-      FILE *f = fopen("/Library/GPUBundles/nvmtl/nvrm610.conf", "r");
+-      if (f) { size_t n = fread(conf, 1, sizeof conf - 1, f); conf[n] = 0; fclose(f); }
+-   }
++   pthread_once(&nvmtl_cfg_once, nvmtl_cfg_load_once);
+    char key[96]; snprintf(key, sizeof key, "%s=", name);
+-   const char *h = strstr(conf, key);
+-   if (!h || (h != conf && h[-1] != '\n')) return NULL;
+-   static char val[8][64]; static unsigned vi; char *v = val[vi++ % 8]; size_t i = 0; h += strlen(key);
++   const char *h = strstr(nvmtl_cfg_conf, key);
++   if (!h || (h != nvmtl_cfg_conf && h[-1] != '\n')) return NULL;
++   static _Thread_local char val[8][64]; static _Thread_local unsigned vi; char *v = val[vi++ % 8]; size_t i = 0; h += strlen(key);
+    while (h[i] && h[i] != '\n' && i < 63) { v[i] = h[i]; i++; }
+    v[i] = 0;
+    fprintf(stderr, "nvk-cfg: %s=%s (nvrm610.conf)\n", name, v);

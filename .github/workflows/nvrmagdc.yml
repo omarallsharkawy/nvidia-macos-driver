@@ -1,0 +1,41 @@
+name: nvrmagdc
+on:
+  workflow_dispatch:
+  push:
+    branches: [loq-perf]
+    paths: ['kexts/NVRMAGDC/**', 'build/build_agdc.sh', 'build/warnings.txt', 'build/warn_ceiling.sh', '.github/workflows/nvrmagdc.yml']
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Pick the newest Xcode
+        run: |
+          ls -d /Applications/Xcode*.app
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); echo "using $X"
+          sudo xcode-select -s "$X/Contents/Developer"; xcrun clang --version; xcrun --sdk macosx --show-sdk-version
+      - name: Build base (3.0, main) and loq-perf NVRMAGDC.kext
+        run: |
+          build() {
+            rm -rf "src-$2" "out/$2" && mkdir -p "src-$2" "out/$2"
+            git archive "$1" kexts/NVRMAGDC build | tar x -C "src-$2"
+            bash "src-$2/build/build_agdc.sh" "src-$2/kexts/NVRMAGDC" "$GITHUB_WORKSPACE/out/$2" \
+              || { cat "$GITHUB_WORKSPACE/out/$2"/*.err 2>/dev/null; return 1; }
+            echo "$2: warnings $(grep -c ': warning:' "out/$2/cc.err" || true), minos $(vtool -show-build "out/$2/NVRMAGDC.kext/Contents/MacOS/NVRMAGDC" | awk '/minos/{print $2; exit}')"
+            git rev-parse "$1" > "out/$2/rev.txt"
+            nm -gU "out/$2/NVRMAGDC.kext/Contents/MacOS/NVRMAGDC" | awk '{print $3}' | sort > "out/$2/exports.txt"
+            nm -u  "out/$2/NVRMAGDC.kext/Contents/MacOS/NVRMAGDC" | sort -u > "out/$2/undefs.txt"
+            strings -a "out/$2/NVRMAGDC.kext/Contents/MacOS/NVRMAGDC" | sort -u > "out/$2/strings.txt"
+            vtool -show-build "out/$2/NVRMAGDC.kext/Contents/MacOS/NVRMAGDC" || true
+            shasum -a 256 "out/$2/NVRMAGDC.kext/Contents/MacOS/NVRMAGDC"
+          }
+          build origin/main base
+          build HEAD loq
+          ls -la out/*
+          echo "exports only in base:"; comm -23 out/base/exports.txt out/loq/exports.txt | head
+          echo "exports only in loq:";  comm -13 out/base/exports.txt out/loq/exports.txt | head
+          echo "undefs only in base:";  comm -23 out/base/undefs.txt  out/loq/undefs.txt  | head -30
+          echo "undefs only in loq:";   comm -13 out/base/undefs.txt  out/loq/undefs.txt  | head -30
+      - uses: actions/upload-artifact@v4
+        with: { name: NVRMAGDC, path: out/ }
