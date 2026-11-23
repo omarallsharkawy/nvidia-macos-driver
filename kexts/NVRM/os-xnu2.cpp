@@ -515,7 +515,7 @@ extern "C" void nv_pm_alias_drop(void *cookie)
     bool release = (--a->kmaps == 0) && a->freed && !a->pinned;
     IOSimpleLockUnlock(nv_pm_lock);
     OSDecrementAtomic64((volatile SInt64 *)&nv_pm_alias_live);
-    if (release) { OSIncrementAtomic64((volatile SInt64 *)&nv_pm_deferred_rel); nv_pm_note(8, a->ptes ? a->ptes[0] : 0, a->bytes, 0); nv_q_put(a); }
+    if (release) { OSIncrementAtomic64((volatile SInt64 *)&nv_pm_deferred_rel); nv_pm_note(8, a->ptes ? a->ptes[0] : 0, a->bytes, 0); if (nv_diag_on()) nv_q_put(a); else nv_q_release(a); }
 }
 // Only the framebuffer aperture. nv_pm_is_gpu below answers for every bar, which is what its other
 // callers want, but a range handed to a user process must never be the register file: a writable mapping
@@ -1141,9 +1141,11 @@ NV_STATUS NV_API_CALL nv_alloc_pages(nv_state_t *nv, NvU32 page_count, NvU64 pag
     if (nv_diag_on()) nv_pv_start();   // detect-only page sentinel thread from the class-F panic hunt
     *priv_data = a;
     if (nv_xnu_live_n < 512) nv_xnu_live[nv_xnu_live_n++] = a;
-    nv_watch_init(); nv_q_init(); OSIncrementAtomic64((volatile SInt64 *)&nv_watch_allocs); OSAddAtomic64((SInt64)bytes, (volatile SInt64 *)&nv_watch_bytes_seen);
-    if (contiguous) nv_watch_range("ALLOC", pte_array[0], bytes, pte_array[0], bytes, cache_type, contiguous);
-    else for (NvU32 i = 0; i < n; i++) nv_watch_range("ALLOC", pte_array[i], PAGE_SIZE, pte_array[0], bytes, cache_type, contiguous);
+    if (nv_diag_on()) {
+        nv_watch_init(); nv_q_init(); OSIncrementAtomic64((volatile SInt64 *)&nv_watch_allocs); OSAddAtomic64((SInt64)bytes, (volatile SInt64 *)&nv_watch_bytes_seen);
+        if (contiguous) nv_watch_range("ALLOC", pte_array[0], bytes, pte_array[0], bytes, cache_type, contiguous);
+        else for (NvU32 i = 0; i < n; i++) nv_watch_range("ALLOC", pte_array[i], PAGE_SIZE, pte_array[0], bytes, cache_type, contiguous);
+    }
     if (nv_xnu_chat()) kprintf("NVRM-xnu:   pages ok va=0x%llx pte[0]=0x%llx\n", (unsigned long long)(uintptr_t)va, pte_array[0]);
     return NV_OK;
 }
@@ -1151,24 +1153,28 @@ NV_STATUS NV_API_CALL nv_free_pages(nv_state_t *nv, NvU32 page_count, NvBool con
 {
     TRC; nv_xnu_alloc *a = (nv_xnu_alloc *)priv_data; if (!a) return NV_OK;
     for (int i = 0; i < nv_xnu_live_n; i++) if (nv_xnu_live[i] == a) nv_xnu_live[i] = NULL;
-    OSIncrementAtomic64((volatile SInt64 *)&nv_watch_frees);
     bool pinned = false;
-    for (NvU64 off = 0; off < a->bytes; ) {
-        IOByteCount len = 0; addr64_t p = a->md->getPhysicalSegment((IOByteCount)off, &len, kIOMemoryMapperNone);
-        if (!p || !len) break;
-        if (off + len > a->bytes) len = (IOByteCount)(a->bytes - off);
-        nv_watch_range("FREE", p, len, a->md->getPhysicalSegment(0, NULL, kIOMemoryMapperNone), a->bytes, a->cache, a->contig);
-        if (nv_xnu_kmap_overlap(p, len)) pinned = true;
-        off += len;
+    if (nv_diag_on()) {
+        OSIncrementAtomic64((volatile SInt64 *)&nv_watch_frees);
+        for (NvU64 off = 0; off < a->bytes; ) {
+            IOByteCount len = 0; addr64_t p = a->md->getPhysicalSegment((IOByteCount)off, &len, kIOMemoryMapperNone);
+            if (!p || !len) break;
+            if (off + len > a->bytes) len = (IOByteCount)(a->bytes - off);
+            nv_watch_range("FREE", p, len, a->md->getPhysicalSegment(0, NULL, kIOMemoryMapperNone), a->bytes, a->cache, a->contig);
+            if (nv_xnu_kmap_overlap(p, len)) pinned = true;
+            off += len;
+        }
+        if (pinned) { OSIncrementAtomic64((volatile SInt64 *)&nv_pm_pinned_n); OSAddAtomic64((SInt64)a->bytes, (volatile SInt64 *)&nv_pm_pinned_bytes);
+                      nv_pm_note(4, a->ptes ? a->ptes[0] : 0, a->bytes, 0); }
     }
-    if (pinned) { OSIncrementAtomic64((volatile SInt64 *)&nv_pm_pinned_n); OSAddAtomic64((SInt64)a->bytes, (volatile SInt64 *)&nv_pm_pinned_bytes);
-                  nv_pm_note(4, a->ptes ? a->ptes[0] : 0, a->bytes, 0); }
     const NvU64 pm0 = a->ptes ? a->ptes[0] : 0, pmb = a->bytes;
     if (nv_pm_retire(a, pinned)) {
         if (!pinned) { OSIncrementAtomic64((volatile SInt64 *)&nv_pm_deferred_n); nv_pm_note(3, pm0, pmb, 0); }
         return NV_OK;
     }
-    nv_q_put(a); return NV_OK;
+    if (nv_diag_on()) nv_q_put(a);
+    else nv_q_release(a);
+    return NV_OK;
 }
 void *NV_API_CALL nv_alloc_kernel_mapping(nv_state_t *nv, void *pAllocPrivate, NvU64 pageIndex, NvU32 pageOffset, NvU64 size, void **pPrivate)
 {
@@ -1460,22 +1466,25 @@ extern "C" {
 // The GPU's ACPI node: AppleACPIPCI puts its IOACPIPlane path on the PCI device as "acpi-path".
 // Cached per GPU (PCI address), kept retained for the life of the kext: a PC with two NVIDIA cards must ask each
 // card's own ACPI node, never the first one found.
-static struct { NvU32 domain; NvU8 bus, slot, function; IOACPIPlatformDevice *acpi; } nv_xnu_acpi_nodes[8];
+static struct { volatile SInt32 claimed; NvU32 domain; NvU8 bus, slot, function; IOACPIPlatformDevice *acpi; } nv_xnu_acpi_nodes[8];
 static IOACPIPlatformDevice *nv_xnu_gpu_acpi(nv_state_t *nv)
 {
     if (!nv) return NULL;
     const nv_pci_info_t *pi = &nv->pci_info;
-    for (auto &n : nv_xnu_acpi_nodes)
-        if (n.acpi && n.domain == pi->domain && n.bus == pi->bus && n.slot == pi->slot && n.function == pi->function)
-            return n.acpi;
+    for (auto &n : nv_xnu_acpi_nodes) {
+        IOACPIPlatformDevice *a = __atomic_load_n(&n.acpi, __ATOMIC_ACQUIRE);
+        if (a && n.domain == pi->domain && n.bus == pi->bus && n.slot == pi->slot && n.function == pi->function)
+            return a;
+    }
     nv_xnu_pci_slot *s = (nv_xnu_pci_slot *)os_pci_init_handle(pi->domain, pi->bus, pi->slot, pi->function, NULL, NULL);
     OSString *path = s ? OSDynamicCast(OSString, s->pci->getProperty("acpi-path")) : NULL;
     IORegistryEntry *e = path ? IORegistryEntry::fromPath(path->getCStringNoCopy()) : NULL;
     IOACPIPlatformDevice *acpi = OSDynamicCast(IOACPIPlatformDevice, e);
     if (!acpi) { OSSafeReleaseNULL(e); return NULL; }
     for (auto &n : nv_xnu_acpi_nodes)
-        if (!n.acpi && OSCompareAndSwapPtr(NULL, acpi, (void * volatile *)&n.acpi)) {
+        if (!n.claimed && OSCompareAndSwap(0, 1, &n.claimed)) {
             n.domain = pi->domain; n.bus = pi->bus; n.slot = pi->slot; n.function = pi->function;
+            __atomic_store_n(&n.acpi, acpi, __ATOMIC_RELEASE);
             kprintf("NVRM-xnu: GPU %02x:%02x.%x ACPI node %s\n", pi->bus, pi->slot, pi->function, path->getCStringNoCopy());
             return acpi;
         }
@@ -1696,29 +1705,47 @@ void  NV_API_CALL nv_get_screen_info(nv_state_t *nv, NvU64 *pa, NvU32 *w, NvU32 
 }
 NvU32 NV_API_CALL nv_get_dev_minor(nv_state_t *nv) { TRC; return 0; }
 
-struct nv_nano_timer { nv_state_t *nv; void *event; thread_call_t call; };
+struct nv_nano_timer { nv_state_t *nv; void *event; thread_call_t call; volatile SInt32 stopping; volatile SInt32 running; };
 static void nv_xnu_nano_fire(thread_call_param_t p0, thread_call_param_t p1)
 {
     nv_nano_timer_t *t = (nv_nano_timer_t *)p0;
-    rm_run_nano_timer_callback(NULL, t->nv, t->event);
+    if (!t) return;
+    OSIncrementAtomic(&t->running);
+    if (!__atomic_load_n(&t->stopping, __ATOMIC_ACQUIRE))
+        rm_run_nano_timer_callback(NULL, t->nv, t->event);
+    OSDecrementAtomic(&t->running);
 }
 void NV_API_CALL nv_create_nano_timer(nv_state_t *nv, void *pTmrEvent, nv_nano_timer_t **pt)
 {
     TRC; nv_nano_timer_t *t = (nv_nano_timer_t *)kern_os_malloc(sizeof *t);
     if (!t) { *pt = NULL; return; }
-    t->nv = nv; t->event = pTmrEvent; t->call = thread_call_allocate(nv_xnu_nano_fire, t);
+    t->nv = nv; t->event = pTmrEvent; t->stopping = 0; t->running = 0;
+    t->call = thread_call_allocate(nv_xnu_nano_fire, t);
     *pt = t;
 }
 void NV_API_CALL nv_start_nano_timer(nv_state_t *nv, nv_nano_timer_t *t, NvU64 timens)
 {
-    if (!t || !t->call) return;
-    uint64_t deadline; clock_interval_to_deadline((uint32_t)(timens / 1000ULL), kMicrosecondScale, &deadline);
+    if (!t || !t->call || __atomic_load_n(&t->stopping, __ATOMIC_ACQUIRE)) return;
+    const NvU64 usec = timens / 1000ULL;
+    uint64_t deadline; clock_interval_to_deadline((uint32_t)(usec > 0xffffffffULL ? 0xffffffffU : usec), kMicrosecondScale, &deadline);
     thread_call_enter_delayed(t->call, deadline);
 }
 void NV_API_CALL nv_cancel_nano_timer(nv_state_t *nv, nv_nano_timer_t *t) { if (t && t->call) thread_call_cancel(t->call); }
 void NV_API_CALL nv_destroy_nano_timer(nv_state_t *nv, nv_nano_timer_t *t)
 {
-    TRC; if (!t) return; if (t->call) { thread_call_cancel(t->call); thread_call_free(t->call); } kern_os_free(t);
+    TRC; if (!t) return;
+    __atomic_store_n(&t->stopping, 1, __ATOMIC_RELEASE);
+    bool freed = true;
+    if (t->call) {
+        thread_call_cancel(t->call);
+        while (__atomic_load_n(&t->running, __ATOMIC_ACQUIRE) > 0) IOSleep(1);
+        freed = false;
+        for (int tries = 0; tries < 200; tries++) {
+            if (thread_call_free(t->call)) { freed = true; break; }
+            IOSleep(1);
+        }
+    }
+    if (freed) kern_os_free(t);
 }
 
 extern "C" nv_file_private_t *nv_xnu_lookup_fd(NvS32 fd, void **priv, NvBool *isCtl);

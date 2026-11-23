@@ -207,7 +207,7 @@ static void rematchNvidiaAudio() {
 }
 
 static void onHdaLoaded(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
-    if (orgProbe) return;
+    if (orgProbe || index != kHda.loadIndex) return;
     auto probe = patcher.solveSymbol(index, "__ZN18AppleHDAController5probeEP9IOServicePi", address, size);
     patcher.clearError();
     if (!probe) return;
@@ -259,7 +259,7 @@ static KernelPatcher::KextInfo topologyFamily {
 static void topologyFamilyLoaded(void *, KernelPatcher &patcher, size_t index,
                                  mach_vm_address_t address, size_t size) {
     // Lilu broadcasts all requested images; a later unrelated image must not erase this entry.
-    if (gTopologyVerb) return;
+    if (gTopologyVerb || (address && index != topologyFamily.loadIndex)) return;
     auto execute = patcher.solveSymbol(index,
         "__ZN16IOHDACodecDevice11executeVerbEtttPjb", address, size);
     patcher.clearError();
@@ -284,7 +284,7 @@ static void startVolumeWhenReady() {
         report("vol", nmhdaVolumeStart(gVolumeApi, report) ? "watching for display audio engines" : "could not start");
 }
 static void onAppleHdaLoaded(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
-    if (gClipRouted) return;
+    if (gClipRouted || index != kAppleHda.loadIndex) return;
     if (!patcher.solveSymbol(index, "__ZN14AppleHDAEngine17clipOutputSamplesEPKvPvjjPK20_IOAudioStreamFormatP13IOAudioStream",
                              address, size)) { patcher.clearError(); return; }
     KernelPatcher::RouteRequest route { "__ZN14AppleHDAEngine17clipOutputSamplesEPKvPvjjPK20_IOAudioStreamFormatP13IOAudioStream",
@@ -295,7 +295,7 @@ static void onAppleHdaLoaded(void *, KernelPatcher &patcher, size_t index, mach_
     startVolumeWhenReady();
 }
 static void onAudioFamilyLoaded(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size) {
-    if (gVolumeApi.createVolumeControl) return;
+    if (gVolumeApi.createVolumeControl || index != kAudioFamily.loadIndex) return;
     auto vol = patcher.solveSymbol(index, "__ZN19IOAudioLevelControl19createVolumeControlEiiiiijPKcjj", address, size);
     patcher.clearError();
     auto mute = patcher.solveSymbol(index, "__ZN19IOAudioToggleControl17createMuteControlEbjPKcjj", address, size);

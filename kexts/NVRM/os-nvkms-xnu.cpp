@@ -364,22 +364,62 @@ struct nvkms_timer_t {
     void *dataPtr; NvU32 dataU32;
     NvBool isRefPtr, cancel, complete;
 };
-static void kms_timer_release(struct nvkms_timer_t *t) { if (t->call) thread_call_free(t->call); kern_os_free(t); }
-static void kms_timer_execute(struct nvkms_timer_t *t)
+static nvkms_timer_t *gKmsTimerFreeHead = NULL;
+static unsigned gKmsTimerFreeCount = 0;
+static const unsigned kKmsTimerFreeMax = 64;
+static struct nvkms_timer_t *kms_timer_alloc(void)
 {
-    void *dataPtr;
+    struct nvkms_timer_t *t = NULL;
+    if (gKmsTimerQueueLock) {
+        IOSimpleLockLock(gKmsTimerQueueLock);
+        if (gKmsTimerFreeHead) {
+            t = gKmsTimerFreeHead;
+            gKmsTimerFreeHead = t->next;
+            gKmsTimerFreeCount--;
+        }
+        IOSimpleLockUnlock(gKmsTimerQueueLock);
+    }
+    if (!t) t = (struct nvkms_timer_t *)kern_os_malloc(sizeof *t);
+    if (t) nvu_memset(t, 0, sizeof *t);
+    return t;
+}
+static void kms_timer_release(struct nvkms_timer_t *t)
+{
+    if (t->call) { thread_call_free(t->call); t->call = NULL; }
+    if (gKmsTimerQueueLock) {
+        bool pooled = false;
+        IOSimpleLockLock(gKmsTimerQueueLock);
+        if (gKmsTimerFreeCount < kKmsTimerFreeMax) {
+            t->next = gKmsTimerFreeHead;
+            gKmsTimerFreeHead = t;
+            gKmsTimerFreeCount++;
+            pooled = true;
+        }
+        IOSimpleLockUnlock(gKmsTimerQueueLock);
+        if (pooled) return;
+    }
+    kern_os_free(t);
+}
+static void kms_timer_execute_batch(nvkms_timer_t **batch, unsigned count)
+{
+    nvkms_timer_t *toFree[8];
+    unsigned nFree = 0;
     IOLockLock(gKmsLock);
     // As nvkms_kthread_q_callback: hold timers (DP IRQs, hot-plug) until the resume. On a GPU that never came back
     // the callback is skipped but the timer completes as usual: NVKMS still owns a plain timer's handle and frees it
     // with nvkms_free_timer(), so it must not be treated as cancelled (and freed) here.
     const bool gpuUp = kms_pm_wait_locked(false, 0);
-    if (t->isRefPtr) { dataPtr = nvkms_dec_ref((struct nvkms_ref_ptr *)t->dataPtr); if (!dataPtr) t->cancel = NV_TRUE; }
-    else dataPtr = t->dataPtr;
-    if (!t->cancel) { if (gpuUp) t->proc(dataPtr, t->dataU32); t->complete = NV_TRUE; }
-    NvBool freeIt = t->isRefPtr || t->cancel;
+    for (unsigned i = 0; i < count; i++) {
+        nvkms_timer_t *t = batch[i];
+        void *dataPtr;
+        if (t->isRefPtr) { dataPtr = nvkms_dec_ref((struct nvkms_ref_ptr *)t->dataPtr); if (!dataPtr) t->cancel = NV_TRUE; }
+        else dataPtr = t->dataPtr;
+        if (!t->cancel) { if (gpuUp) t->proc(dataPtr, t->dataU32); t->complete = NV_TRUE; }
+        if (t->isRefPtr || t->cancel) toFree[nFree++] = t;
+    }
     IOLockUnlock(gKmsLock);
-    if (freeIt) kms_timer_release(t);
-    OSAddAtomic64(1, &gKmsTimerExecuted);
+    for (unsigned i = 0; i < nFree; i++) kms_timer_release(toFree[i]);
+    OSAddAtomic64((SInt64)count, &gKmsTimerExecuted);
 }
 static void kms_timer_enqueue(nvkms_timer_t *t)
 {
@@ -398,19 +438,21 @@ static void kms_timer_enqueue(nvkms_timer_t *t)
 static void kms_timer_drain(thread_call_param_t, thread_call_param_t)
 {
     for (;;) {
+        nvkms_timer_t *batch[8];
+        unsigned count = 0;
         IOSimpleLockLock(gKmsTimerQueueLock);
-        nvkms_timer_t *t = gKmsTimerHead;
-        if (t) {
+        while (gKmsTimerHead && count < 8) {
+            nvkms_timer_t *t = gKmsTimerHead;
             gKmsTimerHead = t->next;
             if (!gKmsTimerHead) gKmsTimerTail = NULL;
             t->next = NULL;
             gKmsTimerDepth--;
-        } else {
-            gKmsTimerWorkerActive = false;
+            batch[count++] = t;
         }
+        if (count == 0) gKmsTimerWorkerActive = false;
         IOSimpleLockUnlock(gKmsTimerQueueLock);
-        if (!t) return;
-        kms_timer_execute(t);
+        if (count == 0) return;
+        kms_timer_execute_batch(batch, count);
     }
 }
 static void kms_timer_fire(thread_call_param_t p0, thread_call_param_t)
@@ -419,9 +461,8 @@ static void kms_timer_fire(thread_call_param_t p0, thread_call_param_t)
 }
 static struct nvkms_timer_t *kms_timer_start(nvkms_timer_proc_t *proc, void *dataPtr, NvU32 dataU32, NvBool isRefPtr, NvU64 usec)
 {
-    struct nvkms_timer_t *t = (struct nvkms_timer_t *)kern_os_malloc(sizeof *t);
+    struct nvkms_timer_t *t = kms_timer_alloc();
     if (!t) return NULL;
-    nvu_memset(t, 0, sizeof *t);
     t->proc = proc; t->dataPtr = dataPtr; t->dataU32 = dataU32; t->isRefPtr = isRefPtr;
     if (usec == 0) {
         if (isRefPtr) nvkms_inc_ref((struct nvkms_ref_ptr *)dataPtr);
@@ -430,7 +471,7 @@ static struct nvkms_timer_t *kms_timer_start(nvkms_timer_proc_t *proc, void *dat
         return t;
     }
     t->call = thread_call_allocate(kms_timer_fire, t);
-    if (!t->call) { kern_os_free(t); return NULL; }
+    if (!t->call) { kms_timer_release(t); return NULL; }
     if (isRefPtr) nvkms_inc_ref((struct nvkms_ref_ptr *)dataPtr);
     uint64_t deadline;
     clock_interval_to_deadline((uint32_t)(usec > 0xffffffffull ? 0xffffffffu : usec), kMicrosecondScale, &deadline);

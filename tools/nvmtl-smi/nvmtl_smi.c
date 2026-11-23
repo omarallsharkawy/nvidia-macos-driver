@@ -8,6 +8,7 @@
 #include <string.h>
 #include <unistd.h>
 #include "nvRmApi.h"
+#include "nvmisc.h"
 #include "ctrl/ctrl0000/ctrl0000gpu.h"
 #include "class/cl0080.h"
 #include "class/cl2080.h"
@@ -19,6 +20,9 @@ int main(int argc, char **argv)
 {
     unsigned want = argc > 1 ? (unsigned)atoi(argv[1]) : 0;
     struct NvRmApi rm; memset(&rm, 0, sizeof rm);
+    char nodeName[32];
+    snprintf(nodeName, sizeof nodeName, "/dev/nvidia%u", want);
+    rm.nodeName = nodeName;
     rm.fd = NVRM_OPEN(NVRM_CTL_NODE_NAME);
     if (rm.fd < 0) { fprintf(stderr, "nvmtl-smi: cannot open %s (is the driver loaded?)\n", NVRM_CTL_NODE_NAME); return 2; }
     NvHandle hClient = 0, hDevice = 0, hSub = 0, hRusd = 0;
@@ -30,6 +34,7 @@ int main(int argc, char **argv)
     }
     NV0000_CTRL_GPU_GET_ID_INFO_V2_PARAMS info = { .gpuId = ids.gpuIds[want] };
     if (nvRmApiControl(&rm, hClient, NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2, &info, sizeof info) != NV_OK) { fprintf(stderr, "nvmtl-smi: no id info\n"); return 2; }
+    snprintf(nodeName, sizeof nodeName, "/dev/nvidia%u", (unsigned)info.deviceInstance);
     NV0080_ALLOC_PARAMETERS dp = { .deviceId = info.deviceInstance, .hClientShare = hClient };
     NV2080_ALLOC_PARAMETERS sp = { .subDeviceId = info.subDeviceInstance };
     if (nvRmApiAlloc(&rm, hClient, &hDevice, NV01_DEVICE_0, &dp) != NV_OK || nvRmApiAlloc(&rm, hDevice, &hSub, NV20_SUBDEVICE_0, &sp) != NV_OK) {
@@ -40,7 +45,7 @@ int main(int argc, char **argv)
     NvU32 st = nvRmApiAlloc(&rm, hSub, &hRusd, RM_USER_SHARED_DATA, &rp);
     if (st != NV_OK) { fprintf(stderr, "nvmtl-smi: the resource manager refused the shared-data block (0x%x)\n", st); return 3; }
     struct NvRmApiMapping map; memset(&map, 0, sizeof map);
-    st = nvRmApiMapMemory(&rm, hDevice, hRusd, 0, sizeof(NV00DE_SHARED_DATA), false, 0, &map);
+    st = nvRmApiMapMemory(&rm, hSub, hRusd, 0, sizeof(NV00DE_SHARED_DATA), true, DRF_DEF(OS33, _FLAGS, _ACCESS, _READ_ONLY), &map);
     if (st != NV_OK || !map.address) { fprintf(stderr, "nvmtl-smi: cannot map the shared-data block (0x%x)\n", st); return 3; }
     usleep(1500 * 1000);   /* polling starts at allocation; give it a pass */
     NV00DE_SHARED_DATA snap;

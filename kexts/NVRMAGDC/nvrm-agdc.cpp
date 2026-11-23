@@ -7,6 +7,7 @@
 #include "nvrm_off.h"
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
+#include <IOKit/IOLocks.h>
 #include <sys/sysctl.h>
 #include <kern/thread_call.h>
 #include <kern/clock.h>          // clock_get_uptime/nanoseconds_to_absolutetime: the 0x980 rescan throttle
@@ -50,8 +51,21 @@ static int    gAgdcLogged = 0;
 static SInt64 gAgdcRescans = 0;
 
 enum { kAgdcMaxFB = 4 };
+static IOLock    *gAgdcLock = nullptr;
 static IOService *gAgdcFB[kAgdcMaxFB];
 static unsigned  gAgdcNFB = 0;
+static IOLock *nvdaAgdcLock(void)
+{
+    IOLock *l = __atomic_load_n(&gAgdcLock, __ATOMIC_ACQUIRE);
+    if (!l) {
+        l = IOLockAlloc();
+        if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gAgdcLock)) {
+            IOLockFree(l);
+            l = __atomic_load_n(&gAgdcLock, __ATOMIC_ACQUIRE);
+        }
+    }
+    return l;
+}
 enum { kAgdcFBMapBytes = 3 + kAgdcMaxFB * 25 + 52 + 1 };
 static_assert(kAgdcMaxFB >= 1 && kAgdcMaxFB <= 8, "IOPresentment's map holds 8 (kext 0x31b3), and kAgdcFBMapBytes assumes one digit for n and each slot index");
 static char   gAgdcFBMap[kAgdcFBMapBytes] = "never scanned";
@@ -78,14 +92,28 @@ OSDefineMetaClassAndStructors(NVDADeviceControl, AppleGraphicsDeviceControl)
 
 static IOReturn nvdaK5Answer(IOService *fb, unsigned int cmd, unsigned long *in, unsigned long inSize, unsigned long *out, unsigned long *outSize)
 {
-    IOService *slot[kAgdcMaxFB]; unsigned nh = gAgdcNFB;
-    if (nh == 0 || nh > kAgdcMaxFB) { slot[0] = fb; nh = 1; } else for (unsigned i = 0; i < nh; i++) slot[i] = gAgdcFB[i];
+    IOService *slot[kAgdcMaxFB] = {}; bool present[kAgdcMaxFB] = {}; unsigned nh = 0;
+    IOLock *lk = nvdaAgdcLock();
+    if (lk) IOLockLock(lk);
+    nh = gAgdcNFB;
+    if (nh == 0 || nh > kAgdcMaxFB) {
+        slot[0] = fb;
+        if (slot[0]) { slot[0]->retain(); present[0] = true; }
+        nh = 1;
+    } else {
+        for (unsigned i = 0; i < nh; i++) {
+            slot[i] = gAgdcFB[i];
+            if (slot[i]) { slot[i]->retain(); present[i] = true; }
+        }
+    }
+    if (lk) IOLockUnlock(lk);
     uint32_t t[kAgdcMaxFB][NVK5_TIMING_WORDS]; struct nvk5_head h[kAgdcMaxFB];
     for (unsigned i = 0; i < nh; i++) {
         unsigned long tBytes = 0; bool have = false;
         OSObject *o = slot[i] ? slot[i]->copyProperty("NVRMTiming") : NULL; OSData *d = OSDynamicCast(OSData, o);
         if (d) { have = true; tBytes = d->getLength(); bzero(t[i], sizeof t[i]); if (tBytes == sizeof t[i]) memcpy(t[i], d->getBytesNoCopy(), sizeof t[i]); }
         OSSafeReleaseNULL(o);
+        if (slot[i]) { slot[i]->release(); slot[i] = nullptr; }
         h[i].t = have ? t[i] : NULL; h[i].tBytes = tBytes;
     }
     int why = 0; int32_t idx = -1;
@@ -95,7 +123,7 @@ static IOReturn nvdaK5Answer(IOService *fb, unsigned int cmd, unsigned long *in,
     if (r == NVK5_R_LINK) { OSAddAtomic64(1, &gAgdcK5Link); OSBitOrAtomic(bit, (volatile UInt32 *)&gAgdcK5LinkMask); return kIOReturnSuccess; }
     if (r == NVK5_R_CAPS) { OSAddAtomic64(1, &gAgdcK5Caps); OSBitOrAtomic(bit, (volatile UInt32 *)&gAgdcK5CapsMask); return kIOReturnSuccess; }
     if (r == NVK5_R_UNSUPPORTED) return kIOReturnUnsupported;
-    if (r == NVK5_R_NOTFOUND && idx >= 0 && (unsigned)idx < nh && !slot[idx]) why = 0x30;
+    if (r == NVK5_R_NOTFOUND && idx >= 0 && (unsigned)idx < nh && !present[idx]) why = 0x30;
     gAgdcK5Why = why; gAgdcK5LastRefusedIdx = idx;
     if (gAgdcLogged < 40) { gAgdcLogged++; FBLOG("AGDC K5: command %#x index %d NOT answered (why %#x, %u slot(s)) [%d/40]", cmd, idx, why, nh, gAgdcLogged); }
     return r == NVK5_R_BADARG ? kIOReturnBadArgument : kIOReturnNotFound;
@@ -115,13 +143,23 @@ static void nvdaAgdcRescanForReply(IOService *pci)
     static uint64_t last = 0;
     uint64_t now = 0; clock_get_uptime(&now);
     uint64_t per = 0; nanoseconds_to_absolutetime(1000000000ull, &per);
-    if (last && now - last < per) return;
+    IOLock *lk = nvdaAgdcLock();
+    unsigned before = 0;
+    if (lk) IOLockLock(lk);
+    if (last && now - last < per) {
+        if (lk) IOLockUnlock(lk);
+        return;
+    }
     last = now;
-    const unsigned before = gAgdcNFB;
+    before = gAgdcNFB;
+    if (lk) IOLockUnlock(lk);
     nvdaAgdcScan(pci);
     OSAddAtomic64(1, &gAgdcRescans);
-    if (gAgdcNFB != before)
-        FBLOG("AGDC: 0x980 rescan -> %u framebuffer slot(s) (was %u)", gAgdcNFB, before);
+    if (lk) IOLockLock(lk);
+    const unsigned after = gAgdcNFB;
+    if (lk) IOLockUnlock(lk);
+    if (after != before)
+        FBLOG("AGDC: 0x980 rescan -> %u framebuffer slot(s) (was %u)", after, before);
 }
 
 IOReturn NVDADeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned long *in, unsigned long inSize,
@@ -138,6 +176,8 @@ IOReturn NVDADeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned 
         if (!out || !outSize || *outSize != sizeof(NVAGDCGPUCapability)) return kIOReturnBadArgument;
         nvdaAgdcRescanForReply(fPci);   // a framebuffer that started after boot has to be in this reply
         NVAGDCGPUCapability *c = (NVAGDCGPUCapability *)out; bzero(c, sizeof *c);
+        IOLock *lk = nvdaAgdcLock();
+        if (lk) IOLockLock(lk);
         unsigned n = gAgdcNFB;
         if (n == 0 || n > kAgdcMaxFB) {
             c->portMask = 1ull << 1;
@@ -148,6 +188,7 @@ IOReturn NVDADeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned 
             c->countA = c->countB = c->countC = c->countD = n;
             c->maxFramebuffers = n; c->pciDevice = fPci;
         }
+        if (lk) IOLockUnlock(lk);
         // Boot-arg nvagdcheads=1: report the framebuffer slots that CAN exist (nvfbheads) as the maximum, not only the ones
         // started now. With one display at boot the reply said 1, and macOS then refused the framebuffer a later hot-plug
         // starts (1401 issue 146, "AGDC maxfb=1"). The framebuffer[] list and port mask still name only the started ones.
@@ -173,10 +214,14 @@ static int gAgdcState = 0; static NVDADeviceControl *gAgdc = nullptr; static thr
 static IOService *gAgdcFBRef = nullptr;
 static void nvdaAgdcDropTable(void)
 {
+    IOService *old[kAgdcMaxFB] = {};
+    IOLock *lk = nvdaAgdcLock();
+    if (lk) IOLockLock(lk);
     unsigned n = gAgdcNFB; gAgdcNFB = 0;
-    __asm__ __volatile__("" ::: "memory");
-    for (unsigned i = 0; i < kAgdcMaxFB; i++) { IOService *f = gAgdcFB[i]; gAgdcFB[i] = nullptr; if (f) f->release(); }
+    for (unsigned i = 0; i < kAgdcMaxFB; i++) { old[i] = gAgdcFB[i]; gAgdcFB[i] = nullptr; }
     if (n) snprintf(gAgdcFBMap, sizeof gAgdcFBMap, "released (the last table had %u slot(s))", n);
+    if (lk) IOLockUnlock(lk);
+    for (unsigned i = 0; i < kAgdcMaxFB; i++) if (old[i]) old[i]->release();
 }
 static void nvdaAgdcDropFB(void) { if (gAgdcFBRef) { gAgdcFBRef->release(); gAgdcFBRef = nullptr; } nvdaAgdcDropTable(); }
 static void nvdaAgdcTargets(IOService **pci, IOService **fb)
@@ -194,11 +239,22 @@ static int gAgdcScanLogged = 0;
 #define SCANLOG(fmt, ...) do { if (gAgdcScanLogged < 8) { gAgdcScanLogged++; FBLOG("AGDC scan: " fmt " [%d/8]", ##__VA_ARGS__, gAgdcScanLogged); } } while (0)
 static void nvdaAgdcScan(IOService *pci)
 {
-    nvdaAgdcDropTable(); gAgdcScanLogged = 0;
+    gAgdcScanLogged = 0;
     IOService *tab[kAgdcMaxFB] = {}; unsigned seen = 0, noidx = 0, range = 0, dup = 0, other = 0, hole = 0;
     OSDictionary *m = IOService::serviceMatching("NVRMNVDAFramebuffer");
     OSIterator *it = m ? IOService::getMatchingServices(m) : nullptr; OSSafeReleaseNULL(m);
-    if (!it) { snprintf(gAgdcFBMap, sizeof gAgdcFBMap, "n=0 (no iterator: the earlier one-head reply)"); FBLOG("AGDC: slot table %s", gAgdcFBMap); return; }
+    if (!it) {
+        IOService *old[kAgdcMaxFB] = {};
+        IOLock *lk = nvdaAgdcLock();
+        if (lk) IOLockLock(lk);
+        gAgdcNFB = 0;
+        for (unsigned i = 0; i < kAgdcMaxFB; i++) { old[i] = gAgdcFB[i]; gAgdcFB[i] = nullptr; }
+        snprintf(gAgdcFBMap, sizeof gAgdcFBMap, "n=0 (no iterator: the earlier one-head reply)");
+        if (lk) IOLockUnlock(lk);
+        for (unsigned i = 0; i < kAgdcMaxFB; i++) if (old[i]) old[i]->release();
+        FBLOG("AGDC: slot table %s", gAgdcFBMap);
+        return;
+    }
     OSObject *o;
     while (seen < 16 && (o = it->getNextObject())) {
         seen++;
@@ -220,14 +276,21 @@ static void nvdaAgdcScan(IOService *pci)
         hole++; SCANLOG("slot %u (id %#llx) sits beyond a hole at slot %u: left out", i, (unsigned long long)tab[i]->getRegistryEntryID(), n);
         tab[i]->release(); tab[i] = nullptr;
     }
-    for (unsigned i = 0; i < n; i++) gAgdcFB[i] = tab[i];
+    char mapBuf[kAgdcFBMapBytes];
+    int w = snprintf(mapBuf, sizeof mapBuf, "n=%u", n);
+    for (unsigned i = 0; i < n && w > 0 && (unsigned)w < sizeof mapBuf; i++)
+        w += snprintf(mapBuf + w, sizeof mapBuf - (size_t)w, " [%u]id %#llx", i, (unsigned long long)tab[i]->getRegistryEntryID());
+    if (w > 0 && (unsigned)w < sizeof mapBuf && (noidx | range | dup | other | hole))
+        snprintf(mapBuf + w, sizeof mapBuf - (size_t)w, " (left out: noidx %u range %u dup %u gpu %u hole %u)", noidx, range, dup, other, hole);
+    IOService *old[kAgdcMaxFB] = {};
+    IOLock *lk = nvdaAgdcLock();
+    if (lk) IOLockLock(lk);
+    for (unsigned i = 0; i < kAgdcMaxFB; i++) { old[i] = gAgdcFB[i]; gAgdcFB[i] = (i < n) ? tab[i] : nullptr; }
     gAgdcNFB = n;
-    int w = snprintf(gAgdcFBMap, sizeof gAgdcFBMap, "n=%u", n);
-    for (unsigned i = 0; i < n && w > 0 && (unsigned)w < sizeof gAgdcFBMap; i++)
-        w += snprintf(gAgdcFBMap + w, sizeof gAgdcFBMap - (size_t)w, " [%u]id %#llx", i, (unsigned long long)gAgdcFB[i]->getRegistryEntryID());
-    if (w > 0 && (unsigned)w < sizeof gAgdcFBMap && (noidx | range | dup | other | hole))
-        snprintf(gAgdcFBMap + w, sizeof gAgdcFBMap - (size_t)w, " (left out: noidx %u range %u dup %u gpu %u hole %u)", noidx, range, dup, other, hole);
-    FBLOG("AGDC: slot table %s (%u framebuffer node(s) seen)", gAgdcFBMap, seen);
+    strlcpy(gAgdcFBMap, mapBuf, sizeof gAgdcFBMap);
+    if (lk) IOLockUnlock(lk);
+    for (unsigned i = 0; i < kAgdcMaxFB; i++) if (old[i]) old[i]->release();
+    FBLOG("AGDC: slot table %s (%u framebuffer node(s) seen)", mapBuf, seen);
 }
 
 static SInt32 gAgdcBusy = 0;
@@ -328,5 +391,6 @@ void NVDAGDCLoader::stop(IOService *provider)
         else { thread_call_free(gAgdcCall); gAgdcCall = nullptr; }
     }
     if (gAgdc && !gAgdcBusy) { gAgdcWant = 0; nvdaAgdcWorkBody(); }
+    if (!gAgdcBusy && gAgdcLock) { IOLockFree(gAgdcLock); gAgdcLock = nullptr; }
     IOService::stop(provider);
 }

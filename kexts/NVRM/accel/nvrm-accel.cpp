@@ -448,7 +448,10 @@ public:
     // enumerates) and found a display on none of them
     static bool headlessNoDisplayHere() {
         bool seen = false, none = true;
-        if (OSIterator *it = getMatchingServices(serviceMatching("NVRMDisplay"))) {
+        OSDictionary *m = serviceMatching("NVRMDisplay");
+        OSIterator *it = m ? getMatchingServices(m) : nullptr;
+        OSSafeReleaseNULL(m);
+        if (it) {
             while (OSObject *o = it->getNextObject()) {
                 IOService *s = OSDynamicCast(IOService, o);
                 OSNumber *cd = s ? OSDynamicCast(OSNumber, s->getProperty("connected-displays")) : nullptr;
@@ -484,7 +487,9 @@ public:
     // that can give WindowServer a Metal device
     static void headlessDisplayOwner(char *owner, size_t len, bool *other) {
         *other = false;
-        OSIterator *it = getMatchingServices(serviceMatching("IOFramebuffer"));
+        OSDictionary *m = serviceMatching("IOFramebuffer");
+        OSIterator *it = m ? getMatchingServices(m) : nullptr;
+        OSSafeReleaseNULL(m);
         if (!it) return;
         while (OSObject *o = it->getNextObject()) {
             IOService *s = OSDynamicCast(IOService, o);
@@ -1967,7 +1972,7 @@ IOService *NVAccel::locateNVRM()
         }
     }
     OSDictionary *m = IOService::serviceMatching("NVRM");
-    if (m) fNVRM = IOService::waitForMatchingService(m, 100ULL * 1000 * 1000);
+    if (m) { fNVRM = IOService::waitForMatchingService(m, 100ULL * 1000 * 1000); m->release(); }
     return fNVRM;
 }
 static IOService *nvAccelNVRM(NVAccel *owner)
@@ -2373,24 +2378,38 @@ static bool nvAccelIopCacheGet(IOSurface *s, NVResource **res, NVVidMemory **vm,
 {
     if (!gIopFlipCacheLock) return false;
     bool hit = false;
+    IOSurface *dropS = nullptr; NVResource *dropRes = nullptr; NVVidMemory *dropVm = nullptr;
     IOSimpleLockLock(gIopFlipCacheLock);
     for (unsigned i = 0; i < 8; i++) if (gIopFlipCache[i].s == s) {
+        NVResource *r = gIopFlipCache[i].res;
         NVVidMemory *v = gIopFlipCache[i].vm;
-        if (v && v->fRmHandle == gIopFlipCache[i].kmem && v->fBytes == gIopFlipCache[i].bytes) {
-            *res = gIopFlipCache[i].res; *vm = v; *kmem = gIopFlipCache[i].kmem; *bytes = gIopFlipCache[i].bytes;
+        if (r && v && v->fRmHandle == gIopFlipCache[i].kmem && v->fBytes == gIopFlipCache[i].bytes) {
+            ((OSObject *)r)->retain();
+            ((OSObject *)v)->retain();
+            *res = r; *vm = v; *kmem = gIopFlipCache[i].kmem; *bytes = gIopFlipCache[i].bytes;
             gIopFlipCache[i].use = ++gIopFlipCacheTick; hit = true;
+        } else {
+            dropS = gIopFlipCache[i].s; dropRes = r; dropVm = v;
+            gIopFlipCache[i].s = nullptr; gIopFlipCache[i].res = nullptr; gIopFlipCache[i].vm = nullptr;
+            gIopFlipCache[i].kmem = nullptr; gIopFlipCache[i].bytes = 0; gIopFlipCache[i].use = 0;
         }
         break;
     }
     IOSimpleLockUnlock(gIopFlipCacheLock);
+    if (dropVm) ((OSObject *)dropVm)->release();
+    if (dropRes) ((OSObject *)dropRes)->release();
+    if (dropS) ((OSObject *)dropS)->release();
     return hit;
 }
 static void nvAccelIopCachePut(IOSurface *s, NVResource *res, NVVidMemory *vm, void *kmem, unsigned long long bytes)
 {
+    if (!s || !res || !vm) return;
     if (!gIopFlipCacheLock) { IOSimpleLock *l = IOSimpleLockAlloc(); if (l && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gIopFlipCacheLock)) IOSimpleLockFree(l); }
     if (!gIopFlipCacheLock) return;
-    IOSurface *drop = nullptr;
+    IOSurface *dropS = nullptr; NVResource *dropRes = nullptr; NVVidMemory *dropVm = nullptr;
     ((OSObject *)s)->retain();
+    ((OSObject *)res)->retain();
+    ((OSObject *)vm)->retain();
     IOSimpleLockLock(gIopFlipCacheLock);
     unsigned k = 0;
     for (unsigned i = 0; i < 8; i++) {
@@ -2398,11 +2417,13 @@ static void nvAccelIopCachePut(IOSurface *s, NVResource *res, NVVidMemory *vm, v
         if (!gIopFlipCache[i].s) { k = i; break; }
         if (gIopFlipCache[i].use < gIopFlipCache[k].use) k = i;
     }
-    drop = gIopFlipCache[k].s;
+    dropS = gIopFlipCache[k].s; dropRes = gIopFlipCache[k].res; dropVm = gIopFlipCache[k].vm;
     gIopFlipCache[k].s = s; gIopFlipCache[k].res = res; gIopFlipCache[k].vm = vm; gIopFlipCache[k].kmem = kmem;
     gIopFlipCache[k].bytes = bytes; gIopFlipCache[k].use = ++gIopFlipCacheTick;
     IOSimpleLockUnlock(gIopFlipCacheLock);
-    if (drop) ((OSObject *)drop)->release();
+    if (dropVm) ((OSObject *)dropVm)->release();
+    if (dropRes) ((OSObject *)dropRes)->release();
+    if (dropS) ((OSObject *)dropS)->release();
 }
 extern "C" {
 #if defined(NM_ERA) && NM_ERA < 1015
@@ -2453,6 +2474,20 @@ static bool nvAccelIopAsyncBusy(const void *pipe)
         if (gIopAs[h].pipe == pipe && __atomic_load_n(&gIopAs[h].busy, __ATOMIC_ACQUIRE)) return true;
     return false;
 }
+static const OSSymbol *nvAccelFlipSym()
+{
+    static const OSSymbol *sFlipSym = nullptr;
+    const OSSymbol *sym = __atomic_load_n(&sFlipSym, __ATOMIC_ACQUIRE);
+    if (!sym) {
+        const OSSymbol *fresh = OSSymbol::withCStringNoCopy("nvFlipToSurfacePure");
+        if (fresh) {
+            if (!OSCompareAndSwapPtr(nullptr, (void *)fresh, (void *volatile *)&sFlipSym))
+                fresh->release();
+            sym = __atomic_load_n(&sFlipSym, __ATOMIC_ACQUIRE);
+        }
+    }
+    return sym;
+}
 static void nvAccelIopAsyncRun(void *p0, void *)
 {
     NVIopAsync *e = (NVIopAsync *)p0;
@@ -2460,9 +2495,8 @@ static void nvAccelIopAsyncRun(void *p0, void *)
     IOSurface *s = e->s; e->s = nullptr;
   again:
     nvSurfWaitReady(s->getSurfaceID());   // WindowServer did not wait for this composite; the flip does, off its thread
-    const OSSymbol *sym = OSSymbol::withCStringNoCopy("nvFlipToSurfacePure");
+    const OSSymbol *sym = nvAccelFlipSym();
     IOReturn rr = sym ? e->fb->callPlatformFunction(sym, false, &e->f, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
-    if (sym) sym->release();
     const int outcome = nvAccelFlipOutcome(rr);
     if (outcome == kNvFlipShown) {
         gIopAsyncRefuseRun = 0;
@@ -2553,6 +2587,10 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
     NVAccel *a = NVAccel::forDisplay();
     if (!a) return nvAccelIopFlipNo(1);
     if (s->getPixelFormat() != 0x42475241u) return nvAccelIopFlipNo(2);
+    struct NvObjGuard {
+        OSObject *o;
+        ~NvObjGuard() { if (o) o->release(); }
+    };
     NVResource *res = nullptr; NVVidMemory *vm = nullptr; void *kmem = nullptr; unsigned long long bytes = 0;
     if (nvAccelIopCacheGet(s, &res, &vm, &kmem, &bytes)) {
         OSAddAtomic64(1, &gCntIopFlipHit);
@@ -2564,11 +2602,15 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
         vm = res ? nvres_vidmem(res) : nullptr;
         kmem = (vm && vm->fRmHandle && vm->fBytes && !vm->fScanout) ? vm->fRmHandle : nullptr;
         bytes = vm ? vm->fBytes : 0;
+        if (res) ((OSObject *)res)->retain();
+        if (vm) ((OSObject *)vm)->retain();
         if (cache) ((OSObject *)cache)->release();
         nvFamUnlock(a);
         OSAddAtomic64(1, &gCntIopFlipMiss);
         if (kmem) nvAccelIopCachePut(s, res, vm, kmem, bytes);
     }
+    NvObjGuard resGuard { (OSObject *)res };
+    NvObjGuard vmGuard  { (OSObject *)vm };
     volatile unsigned short *valid = res ? *(unsigned short *volatile *)((volatile unsigned char *)res + kNvResValid) : nullptr;
     const bool vramNewest = valid && (valid[6] & 1u);
     if (!kmem) return nvAccelIopFlipNo(4);
@@ -2588,9 +2630,8 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
     f.version = NVRM_FLIP_ABI_VERSION; f.kapiMemory = kmem; f.allocationCookie = vm->fAllocationCookie; f.width = (unsigned)W; f.height = (unsigned)H; f.pitch = (unsigned)P;
     if (gIopAsync && pipe) return nvAccelIopAsyncStart(pipe, fb, head, s, &f);
     nvSurfWaitReady(s->getSurfaceID());
-    const OSSymbol *sym = OSSymbol::withCStringNoCopy("nvFlipToSurfacePure");
+    const OSSymbol *sym = nvAccelFlipSym();
     IOReturn rr = sym ? fb->callPlatformFunction(sym, false, &f, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
-    if (sym) sym->release();
     if (nvAccelFlipOutcome(rr) == kNvFlipKept) { OSAddAtomic64(1, &gCntIopLate); return true; }
     if (nvAccelFlipOutcome(rr) == kNvFlipAsleep) return true;   // display asleep: nothing to show, nothing to copy   // the frame on the panel stays
     if (rr != kIOReturnSuccess) {

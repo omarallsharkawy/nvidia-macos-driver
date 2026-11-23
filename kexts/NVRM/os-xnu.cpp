@@ -37,13 +37,11 @@ NV_STATUS NV_API_CALL os_alloc_mem(void **address, NvU64 size)
     return NV_OK;
 }
 void  NV_API_CALL os_free_mem(void *address) { NV_XNU_TRC; if (address) kern_os_free(address); }
-void *NV_API_CALL os_mem_copy(void *dst, const void *src, NvU32 length) { static unsigned long n = 0; if (++n <= 4 || (n % 1000000) == 0) kprintf("NVRM-xnu: >os_mem_copy #%lu len=%u\n", n, length); nvx_memcpy(dst, src, length); return dst; }
+void *NV_API_CALL os_mem_copy(void *dst, const void *src, NvU32 length) { nvx_memcpy(dst, src, length); return dst; }
 NV_STATUS NV_API_CALL os_memcpy_from_user(void *dst, const void *src, NvU32 length) { NV_XNU_TRC; return copyin((user_addr_t)(uintptr_t)src, dst, length) ? NV_ERR_INVALID_ADDRESS : NV_OK; }
 NV_STATUS NV_API_CALL os_memcpy_to_user(void *dst, const void *src, NvU32 length) { NV_XNU_TRC; return copyout(src, (user_addr_t)(uintptr_t)dst, length) ? NV_ERR_INVALID_ADDRESS : NV_OK; }
 void *NV_API_CALL os_mem_set(void *dst, NvU8 c, NvU32 length)
 {
-    static unsigned long n = 0; n++;
-    if (n <= 4 || (n % 1000000) == 0) kprintf("NVRM-xnu: >os_mem_set #%lu len=%u\n", n, length);
     nvx_memset(dst, c, length);
     return dst;
 }

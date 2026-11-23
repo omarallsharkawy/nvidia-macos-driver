@@ -311,6 +311,7 @@ static inline void nvu_memcpy(void *d, const void *s, size_t n) { __asm__ __vola
 #define NV_XNU_MAX_CLIENTS 32768
 class NVRMUserClient;
 static NVRMUserClient *gNvClients[NV_XNU_MAX_CLIENTS];
+static int             gNvClientsHigh = 0;
 static IOLock         *gNvClientsLock = NULL;
 #include <kern/clock.h>
 #if defined(NM_ERA) && NM_ERA < 1010
@@ -442,6 +443,7 @@ private:
 public:
     volatile UInt32 fEvtSeq = 0;
     volatile SInt32 fEvtWaiters = 0;
+    volatile SInt32 fEvtArmed = 0;
     UInt32 fEvtMagic = 0x4e564556u;
     static NVRMUserClient *fromNvfp(nv_file_private_t *p);
     int  pid() const { return fPid; }
@@ -457,8 +459,8 @@ extern "C" nv_file_private_t *nv_xnu_lookup_fd(NvS32 fd, void **priv, NvBool *is
     int pid = proc_selfpid();
     NVRMUserClient *c = NULL;
     IOLockLock(gNvClientsLock);
-    for (int i = 0; i < NV_XNU_MAX_CLIENTS && !c; i++) { NVRMUserClient *k = gNvClients[i]; if (k && k->pid() == pid && k->boundFd() == (int)fd) c = k; }
-    for (int i = 0; i < NV_XNU_MAX_CLIENTS && !c; i++) { NVRMUserClient *k = gNvClients[i]; if (k && k->pid() == pid && !k->everBound() && k->index() == (int)fd) c = k; }
+    for (int i = 0; i < gNvClientsHigh && !c; i++) { NVRMUserClient *k = gNvClients[i]; if (k && k->pid() == pid && k->boundFd() == (int)fd) c = k; }
+    for (int i = 0; i < gNvClientsHigh && !c; i++) { NVRMUserClient *k = gNvClients[i]; if (k && k->pid() == pid && !k->everBound() && k->index() == (int)fd) c = k; }
     // The caller keeps this client until nv_xnu_put_client. Taken under the table lock: clientClose empties the slot
     // under the same lock, so a client still in the table cannot have been freed.
     if (c && c->cleaned()) c = NULL;
@@ -1064,7 +1066,10 @@ void NVRM::bootHoldCap(thread_call_param_t p0, thread_call_param_t)
 static bool nvrmNoDisplayAnywhere()
 {
     int counts[8]; unsigned n = 0;
-    if (OSIterator *it = IOService::getMatchingServices(IOService::serviceMatching("NVRMDisplay"))) {
+    OSDictionary *m = IOService::serviceMatching("NVRMDisplay");
+    OSIterator *it = m ? IOService::getMatchingServices(m) : nullptr;
+    OSSafeReleaseNULL(m);
+    if (it) {
         while (OSObject *o = it->getNextObject()) {
             IOService *sv = OSDynamicCast(IOService, o);
             if (!sv || n >= 8) continue;
@@ -1186,12 +1191,17 @@ void NVRM::autoGo(void *p0, wait_result_t)
             const uint64_t bar1MB = s->fNv.bars[NV_GPU_BAR_INDEX_FB].size >> 20;
             if (!s->fBar1Placed && bar1MB < 512) why = "BAR1 not placed and below 512 MB (small firmware window)";
             else if (!s->fBar1Placed) LOG("auto-go: BAR1 not placed (%llu MB) - flip allowed", bar1MB);
-            if (!why) if (OSIterator *it = IOService::getMatchingServices(IOService::serviceMatching("IOAccelerator"))) {
-                while (OSObject *o = it->getNextObject()) {
-                    const char *cn = o->getMetaClass()->getClassName();
-                    if (cn && strncmp(cn, "NV", 2)) { why = "another GPU's accelerator is running"; LOG("auto-go: accelerator %s present", cn); break; }
+            if (!why) {
+                OSDictionary *m = IOService::serviceMatching("IOAccelerator");
+                OSIterator *it = m ? IOService::getMatchingServices(m) : nullptr;
+                OSSafeReleaseNULL(m);
+                if (it) {
+                    while (OSObject *o = it->getNextObject()) {
+                        const char *cn = o->getMetaClass()->getClassName();
+                        if (cn && strncmp(cn, "NV", 2)) { why = "another GPU's accelerator is running"; LOG("auto-go: accelerator %s present", cn); break; }
+                    }
+                    it->release();
                 }
-                it->release();
             }
             if (why) {
                 LOG("auto-go: zero-copy flip NOT started: %s; the copy path stays (as -nvrmnoflip)", why);
@@ -1374,7 +1384,10 @@ static bool nvrmAbove4GRouted(UInt64 ownBar3)
 {
     if (ownBar3 >= (4ULL << 30)) return true;
     bool above = false;
-    if (OSIterator *it = IOService::getMatchingServices(IOService::serviceMatching("IOPCIDevice"))) {
+    OSDictionary *m = IOService::serviceMatching("IOPCIDevice");
+    OSIterator *it = m ? IOService::getMatchingServices(m) : nullptr;
+    OSSafeReleaseNULL(m);
+    if (it) {
         while (!above) {
             IOService *d = OSDynamicCast(IOService, it->getNextObject());
             if (!d) break;
@@ -1855,8 +1868,13 @@ IOReturn NVRM::go(uint32_t pass)
             if (!rm_init_event_locks(NULL, nv_get_ctl_state())) { LOG("rm_init_event_locks(ctl) FAILED"); return kIOReturnError; }
             if (!rm_init_event_locks(NULL, nv))                 { LOG("rm_init_event_locks(gpu) FAILED"); return kIOReturnError; }
             LOG("event locks created for the control device and the GPU");
-            rm_write_registry_string(NULL, NULL, "RmMsg", ":", 1);
-            rm_write_registry_dword(NULL, NULL, "ResmanDebugLevel", 0);
+            {
+                UInt32 diag = 0;
+                if (PE_parse_boot_argn("nvrmdiag", &diag, sizeof diag) && diag) {
+                    rm_write_registry_string(NULL, NULL, "RmMsg", ":", 1);
+                    rm_write_registry_dword(NULL, NULL, "ResmanDebugLevel", 0);
+                }
+            }
             // Tell a wedged GSP from a slow one: with classification on, an RPC that times out while the GSP heartbeat is
             // dead fails the GPU at the first timeout instead of the third (see nvrmGspTimeoutFatal). A live heartbeat keeps
             // the RM's own count. Set before nvregdwords so RmGspTimeoutClassification=0 there still wins.
@@ -2534,15 +2552,19 @@ bool NVRMUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 ty
     const bool systemCaller = kauth_getuid() < 500;
     int used = 0, mine = 0, slot = -1;
     IOLockLock(gNvClientsLock);
-    for (int i = 0; i < NV_XNU_MAX_CLIENTS; i++) {
+    for (int i = 0; i < gNvClientsHigh; i++) {
         NVRMUserClient *k = gNvClients[i];
         if (!k) { if (slot < 0) slot = i; continue; }
         used++;
         if (k->fPid == pid) mine++;
     }
+    if (slot < 0 && gNvClientsHigh < NV_XNU_MAX_CLIENTS) slot = gNvClientsHigh;
     const bool overPid = mine >= kNvClientsPerPid;
     const bool overShared = !systemCaller && used >= NV_XNU_MAX_CLIENTS - kNvClientsReserved;
-    if (slot >= 0 && !overPid && !overShared) { gNvClients[slot] = this; fFd = slot; }
+    if (slot >= 0 && !overPid && !overShared) {
+        gNvClients[slot] = this; fFd = slot;
+        if (slot >= gNvClientsHigh) gNvClientsHigh = slot + 1;
+    }
     IOLockUnlock(gNvClientsLock);
     if (overPid || overShared) {
         static unsigned quotaLogged;
@@ -2570,7 +2592,13 @@ IOReturn NVRMUserClient::clientClose(void)
     // One winner only: this was a plain bool test-and-set, so two closes could both run the teardown.
     if (OSCompareAndSwap(0, 1, &fCleaned)) {
         Gate g(fGate);
-        if (gNvClientsLock && fFd >= 0) { IOLockLock(gNvClientsLock); gNvClients[fFd] = NULL; nv_pm_close(fPm); IOLockUnlock(gNvClientsLock); }
+        if (gNvClientsLock && fFd >= 0) {
+            IOLockLock(gNvClientsLock);
+            gNvClients[fFd] = NULL;
+            while (gNvClientsHigh > 0 && !gNvClients[gNvClientsHigh - 1]) gNvClientsHigh--;
+            nv_pm_close(fPm);
+            IOLockUnlock(gNvClientsLock);
+        }
         if (fOwner) { NvXnuPmUse pmUse; rm_cleanup_file_private(NULL, nvState(), &fNvfp); }
         // The ranges are NOT freed here. clientClose can run while another thread is inside
         // clientMemoryForType, which reads this array and hands its entries to
@@ -2820,8 +2848,7 @@ extern "C" void NV_API_CALL nv_post_event(nv_event_t *event, NvHandle hEvent, Nv
     if (c) {
         OSIncrementAtomic64(&gNvEvtMatched);
         OSIncrementAtomic((volatile SInt32 *)&c->fEvtSeq);
-        __sync_synchronize();
-        if (c->fEvtWaiters > 0) {
+        if (__atomic_load_n(&c->fEvtWaiters, __ATOMIC_ACQUIRE) > 0 && OSCompareAndSwap(1, 0, &c->fEvtArmed)) {
             thread_wakeup((event_t)&c->fEvtSeq);
             OSIncrementAtomic64(&gNvEvtWakes);
         }
@@ -2851,9 +2878,11 @@ IOReturn NVRMUserClient::sWaitEvent(OSObject *target, void *reference, IOExterna
         } else {
             OSIncrementAtomic(&me->fEvtWaiters);
             __sync_synchronize();
-            if (me->fEvtSeq == seen) {
+            if (__atomic_load_n(&me->fEvtSeq, __ATOMIC_ACQUIRE) == seen) {
                 assert_wait_timeout((event_t)&me->fEvtSeq, THREAD_ABORTSAFE, (uint32_t)us, NSEC_PER_USEC);
-                if (me->fEvtSeq != seen) thread_wakeup((event_t)&me->fEvtSeq);
+                __atomic_store_n(&me->fEvtArmed, 1, __ATOMIC_RELEASE);
+                __sync_synchronize();
+                if (__atomic_load_n(&me->fEvtSeq, __ATOMIC_ACQUIRE) != seen) thread_wakeup((event_t)&me->fEvtSeq);
                 OSIncrementAtomic64(&gNvEvtSlept);
                 (void)thread_block(THREAD_CONTINUE_NULL);
             }
@@ -2875,8 +2904,10 @@ IOReturn NVRMUserClient::sBindFd(OSObject *target, void *reference, IOExternalMe
     // two connections answered for one fd and the Vulkan device in WindowServer could not be created.
     const int64_t v = (int64_t)args->scalarInput[0];
     if (v > 0x7FFFFFFFLL || v < -0x80000000LL) return kIOReturnBadArgument;
+    if (gNvClientsLock) IOLockLock(gNvClientsLock);
     me->fBound = (int)v;
     me->fEverBound = true;
+    if (gNvClientsLock) IOLockUnlock(gNvClientsLock);
     // A stale mapping context is cleared when the connection is bound to a real fd, the only point where it
     // could be used for a new mapping. Not on detach (a negative value): the userland driver detaches a
     // connection it keeps alive for mappings that are still live, and clearing the context there left those
