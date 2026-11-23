@@ -14585,8 +14585,8 @@ entry:
 !1 = !{}
 !2 = !{!3, !4, !5}
 !3 = !{i32 0, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
-!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uchar4", !"air.arg_name", !"u8_dst"}
-!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"half4", !"air.arg_name", !"h4_dst"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"u8_dst"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"h4_dst"}
 "#;
     let tmp = std::env::temp_dir().join(format!(
         "metal2vulkan_packed_subword_vec_stores_{}",
@@ -14626,7 +14626,7 @@ entry:
 !1 = !{}
 !2 = !{!3, !4}
 !3 = !{i32 0, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
-!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"half", !"air.arg_name", !"dst"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"dst"}
 "#;
     let tmp = std::env::temp_dir().join(format!(
         "metal2vulkan_aligned_scalar_half_store_{}",
@@ -14648,7 +14648,7 @@ entry:
 }
 
 #[test]
-fn native_bda_access_align_honors_v4_aligned16_and_unaligned_align1() {
+fn native_bda_access_align_honors_v4_aligned16_and_clamps_to_scalar_min() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
 
@@ -14691,7 +14691,7 @@ entry:
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("PhysicalStorageBuffer64"), "{asm}");
     assert!(asm.contains("Aligned 16"), "expected Aligned 16 on v4 BDA access:\n{asm}");
-    assert!(asm.contains("Aligned 1"), "expected Aligned 1 on packed i64 BDA access:\n{asm}");
+    assert!(asm.contains("Aligned 8"), "expected Aligned 8 on i64 BDA access per VUID-06314:\n{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()

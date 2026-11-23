@@ -113,7 +113,7 @@ mod tests {
     fn a_groupshared_interlocked_add_becomes_the_air_local_atomic() {
         let src = "  %5 = atomicrmw add i32 addrspace(3)* %4, i32 1 seq_cst, align 4\n";
         let out = lower_raw_atomicrmw(src);
-        assert!(out.contains("  %5 = call i32 @air.atomic.local.add.u.i32(i32 addrspace(3)* %4, i32 1, i32 0, i32 2, i1 true)"), "{out}");
+        assert!(out.contains("  %5 = call i32 @air.atomic.local.add.u.i32(i32 addrspace(3)* %4, i32 1, i32 5, i32 2, i1 true)"), "{out}");
         assert!(
             out.contains(
                 "declare i32 @air.atomic.local.add.u.i32(i32 addrspace(3)*, i32, i32, i32, i1)"

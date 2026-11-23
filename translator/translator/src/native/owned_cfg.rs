@@ -3925,9 +3925,10 @@ fn owned_barrier_error(
         | spirv::MemorySemantics::OUTPUT_MEMORY)
         .bits();
     let semantics_valid = semantics.is_some_and(|semantics| {
-        (semantics & order_mask).count_ones() == 1
-            && semantics & memory_mask != 0
-            && semantics & !(order_mask | memory_mask) == 0
+        (instruction.class.opcode == Op::ControlBarrier && semantics == 0)
+            || ((semantics & order_mask).count_ones() == 1
+                && semantics & memory_mask != 0
+                && semantics & !(order_mask | memory_mask) == 0)
     });
     let valid = instruction.result_type.is_none()
         && instruction.result_id.is_none()

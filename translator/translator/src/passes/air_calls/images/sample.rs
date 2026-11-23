@@ -923,7 +923,9 @@ fn pixel_linear_hw_coord(
     let const_offset = match sample_const_or_dynamic_offset(ctx, false, args, 2) {
         Ok((None, None)) => None,
         Ok((Some(offset), None)) if offset.iter().all(|&v| v == 0) => None,
-        Ok((Some(offset), None)) if offset.iter().all(|&v| (-8..=7).contains(&v)) => {
+        Ok((Some(offset), None))
+            if ctx.nvidia_fast_target && offset.iter().all(|&v| (-8..=7).contains(&v)) =>
+        {
             Some(const_sint_vec(ctx, &offset))
         }
         _ => return None,

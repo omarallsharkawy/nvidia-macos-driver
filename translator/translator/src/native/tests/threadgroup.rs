@@ -3375,7 +3375,7 @@ entry:
   %first = tail call i1 @air.simd_is_first()
   %any = tail call i1 @air.simd_any(i1 %pred)
   %all = tail call i1 @air.simd_all(i1 %pred)
-  %ballot = tail call i64 @air.simd_ballot(i1 %pred)
+  %ballot = tail call i64 @air.simd_ballot.i64(i1 %pred)
   %tz = tail call i32 @air.ctz.i32(i32 %u, i1 false)
   %lz = tail call i32 @air.clz.i32(i32 %u, i1 false)
   %b32 = trunc i64 %ballot to i32
@@ -3399,7 +3399,7 @@ declare float @air.fast_round.f32(float)
 declare i1 @air.simd_is_first()
 declare i1 @air.simd_any(i1)
 declare i1 @air.simd_all(i1)
-declare i64 @air.simd_ballot(i1)
+declare i64 @air.simd_ballot.i64(i1)
 declare i32 @air.ctz.i32(i32, i1)
 declare i32 @air.clz.i32(i32, i1)
 

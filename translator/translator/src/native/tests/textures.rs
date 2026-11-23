@@ -8892,6 +8892,7 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
         crate::reflect::SamplerAddressMode::ClampToEdge,
     );
     let options = passes::TransformOptions::default()
+        .with_nvidia_fast_target(true)
         .with_runtime_sampler(0, state)
         .unwrap();
     let spv = crate::translate_sanitized_native_with_options(ll, Stage::Fragment, &tmp, options)

@@ -68,16 +68,6 @@ impl Emitter {
                     )?;
                     let quad_ty = self.type_id(&LlType::Vector(Box::new(LlType::Int(8)), 4))?;
                     let byte_ty = self.type_id(&LlType::Int(8))?;
-                    if lanes == 4 {
-                        let word = self.emit_raw_word_load_at_index(raw, first, instructions)?;
-                        instructions.push(Self::inst(
-                            Op::Bitcast,
-                            Some(quad_ty),
-                            Some(result),
-                            vec![Operand::IdRef(word)],
-                        ));
-                        return Ok(());
-                    }
                     let mut lane_ids = Vec::with_capacity(lanes as usize);
                     for chunk in 0..words {
                         let index = if chunk == 0 {
@@ -427,8 +417,11 @@ impl Emitter {
         access_align: Option<u64>,
     ) -> u32 {
         let natural = self.device_addr_align(ty);
+        // Vulkan SPIR-V VUID-StandaloneSpirv-PhysicalStorageBuffer64-06314 requires Aligned >= the
+        // largest scalar component size (`natural`), while raising to 8/16 on aligned vectors unlocks
+        // wide LDG.E.64/128 and STG.E.64/128 on Ada SM89.
         match access_align {
-            Some(a) if a > 0 && a.is_power_of_two() => a.min(16) as u32,
+            Some(a) if a > 0 && a.is_power_of_two() => (a.min(16).max(u64::from(natural))) as u32,
             _ => natural,
         }
     }
