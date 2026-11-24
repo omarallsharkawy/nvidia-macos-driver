@@ -6,14 +6,14 @@ on:
     paths: ['kexts/NVRM/*.cpp', 'kexts/NVRM/*.c', 'kexts/NVRM/*.h', 'kexts/NVRM/*.py', 'kexts/NVRM/Info.plist', 'kexts/NVRM/patches/**', '.github/workflows/nvrm.yml']
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - name: Pick the newest Xcode
+      - name: Pick newest Xcode 16 (avoids Xcode 26 ___x86_return_thunk in kexts)
         run: |
           ls -d /Applications/Xcode*.app
-          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); echo "using $X"
+          X=$(ls -d /Applications/Xcode_16*.app | sort -V | tail -1); echo "using $X"
           sudo xcode-select -s "$X/Contents/Developer"; xcrun clang --version; xcrun --sdk macosx --show-sdk-version
       - name: Build NVIDIA open-gpu-kernel-modules RM & NVKMS archives (620.70.06)
         run: |
@@ -31,6 +31,11 @@ jobs:
             git rev-parse "$1" > "out/$2/rev.txt"
             cp "out/$2/imports.txt" "out/$2/undefs.txt" || nm -u "out/$2/NVRM.kext/Contents/MacOS/NVRM" | sort -u > "out/$2/undefs.txt"
             nm -u "out/$2/NVRM.kext/Contents/MacOS/NVRM" | sort -u > "out/$2/undefs-sorted.txt"
+            if grep -qi thunk "out/$2/undefs-sorted.txt"; then
+              echo "STOP: unexpected retpoline thunk undefined symbol in $2 NVRM.kext"
+              grep -i thunk "out/$2/undefs-sorted.txt"
+              return 1
+            fi
             nm -gU "out/$2/NVRM.kext/Contents/MacOS/NVRM" | awk '{print $3}' | sort > "out/$2/exports.txt"
             strings -a "out/$2/NVRM.kext/Contents/MacOS/NVRM" | sort -u > "out/$2/strings.txt"
             vtool -show-build "out/$2/NVRM.kext/Contents/MacOS/NVRM" || true
