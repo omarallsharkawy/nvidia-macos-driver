@@ -24,11 +24,13 @@
 
 extern "C" void nv_xnu_power_refresh(void);                       // nv_xnu_power.cpp: re-reads the battery service
 extern "C" NV_STATUS nvrm_pmgr_configure_tgp(nv_state_t *nv, NvU8 enable);   // nvrm_pmgr.c
+extern "C" void NV_API_CALL rm_power_source_change_event(nvidia_stack_t *, NvU32);   // osapi.c: runtime AC/battery policy
 
 #define NVRM_TGP_FIRST_MS  2000u
-#define NVRM_TGP_PERIOD_MS 5000u
+#define NVRM_TGP_PERIOD_MS 15000u
 
 static int gTgpEnable = 1, gTgpState = -1, gTgpAc = -1, gTgpLastStatus = 0, gTgpApplies = 0;
+static int gTgpLastNotifiedAc = -1;
 SYSCTL_INT(_debug, OID_AUTO, nvrm_tgp_enable, CTLFLAG_RW | CTLFLAG_LOCKED, &gTgpEnable, 0,
            "1 = TGP mode on while on mains power, 0 = hold the VBIOS default power limit");
 SYSCTL_INT(_debug, OID_AUTO, nvrm_tgp_state, CTLFLAG_RD | CTLFLAG_LOCKED, &gTgpState, 0, "TGP mode last sent: 1 on, 0 off, -1 none");
@@ -56,8 +58,18 @@ static void nvrm_tgp_tick_body(void)
     nv_xnu_power_refresh();
     NvU32 plugged = 0;
     gTgpAc = nv_acpi_get_powersource(&plugged) == NV_OK ? (plugged ? 1 : 0) : -1;
+    // Tell GSP-RM when the power source switches between mains and battery at runtime so it applies its notebook DC
+    // clock/power policy immediately instead of staying in AC policy until reboot or sleep/wake.
+    if (gTgpAc >= 0 && gTgpAc != gTgpLastNotifiedAc) {
+        NvXnuPmUse pmUse;
+        if (!gTgpStopping && !gTgpPaused) {
+            rm_power_source_change_event(NULL, gTgpAc == 0 ? 1u : 0u);
+            gTgpLastNotifiedAc = gTgpAc;
+            kprintf("NVRM-xnu: power source event -> %s\n", gTgpAc == 1 ? "mains" : "battery");
+        }
+    }
     const int want = nvrm_tgp_want(gTgpEnable, gTgpAc, gTgpState);
-    if (want >= 0) {
+    if (want >= 0 && !gTgpStopping && !gTgpPaused) {
         NV_STATUS st = nvrm_pmgr_configure_tgp(gTgpNv, (NvU8)want);
         gTgpLastStatus = (int)st;
         gTgpApplies++;
@@ -93,7 +105,7 @@ extern "C" void nvrm_power_start(nv_state_t *nv)
         sysctl_register_oid(&sysctl__debug_nvrm_tgp_applies);
     }
     gTgpNv = nv;
-    gTgpStopping = 0; gTgpPaused = 0; gTgpFails = 0; gTgpState = -1;
+    gTgpStopping = 0; gTgpPaused = 0; gTgpFails = 0; gTgpState = -1; gTgpLastNotifiedAc = -1;
     gTgpCall = thread_call_allocate(nvrm_tgp_tick, NULL);
     if (!gTgpCall) { kprintf("NVRM-xnu: TGP: no thread call\n"); return; }
     kprintf("NVRM-xnu: TGP mode manager armed (nvrmtgp=1), first check in %u ms\n", NVRM_TGP_FIRST_MS);
@@ -106,12 +118,12 @@ extern "C" void nvrm_power_suspend(void)
     if (!gTgpCall) return;
     OSCompareAndSwap(0, 1, &gTgpPaused);
     thread_call_cancel(gTgpCall);
-    for (int i = 0; i < 1000 && gTgpRunning; i++) IOSleep(10);
+    for (int i = 0; i < 300 && gTgpRunning; i++) IOSleep(10);
 }
 extern "C" void nvrm_power_resume(void)
 {
     if (!gTgpCall) return;
-    gTgpState = nvrm_tgp_state_after_resume(); gTgpFails = 0;
+    gTgpState = nvrm_tgp_state_after_resume(); gTgpLastNotifiedAc = -1; gTgpFails = 0;
     OSCompareAndSwap(1, 0, &gTgpPaused);
     nvrm_tgp_arm(NVRM_TGP_FIRST_MS);
 }

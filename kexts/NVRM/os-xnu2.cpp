@@ -11,6 +11,7 @@
 #include <IOKit/IOLocks.h>
 #include <kern/thread.h>
 #include <kern/thread_call.h>
+#include <kern/sched_prim.h>
 #include <kern/clock.h>
 #include <sys/kauth.h>
 #include <kern/task.h>
@@ -1438,7 +1439,15 @@ void NV_API_CALL os_close_file(void *pFile)
     if (f->pageable) IOFree(f->pageable, (vm_size_t)(f->cap * sizeof(bool)));
     IOFree(f, sizeof *f);
 }
-NV_STATUS NV_API_CALL os_schedule(void) { IOSleep(1); return NV_OK; }
+NV_STATUS NV_API_CALL os_schedule(void)
+{
+    // 100 us timed yield via already-imported Mach KPIs (always paired assert_wait_timeout + thread_block,
+    // never bare thread_block): 10-20x faster than IOSleep(1) during FBSR copy-engine channel waits.
+    static int os_schedule_wait_token;
+    assert_wait_timeout((event_t)&os_schedule_wait_token, THREAD_UNINT, 100, NSEC_PER_USEC);
+    (void)thread_block(THREAD_CONTINUE_NULL);
+    return NV_OK;
+}
 
 NvU64 NV_API_CALL os_get_monotonic_tick_resolution_ns(void) { TRC; return 1; }
 NvU64 NV_API_CALL os_get_max_user_va(void) { TRC; return 0x00007FFFFFFFFFFFULL; }

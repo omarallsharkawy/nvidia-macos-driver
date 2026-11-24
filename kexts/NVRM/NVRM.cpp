@@ -2176,7 +2176,7 @@ extern "C" { void nvkms_xnu_suspend(NvU32 gpuId); void nvkms_xnu_resume(NvU32 gp
 
 IOReturn NVRM::setPowerState(unsigned long ordinal, IOService *device)
 {
-    nv_xnu_power_refresh();        // a wake can be a change of power source; this runs before the firmware asks
+    if (ordinal != 0) nv_xnu_power_refresh();   // a wake can be a change of power source; skip on sleep
     const SInt32 pm = OSAddAtomic(0, &fGpuPm);
     if (ordinal == 0 && pm == kGpuPmRunning && fAdapter) gpuSuspend();
     else if (ordinal != 0 && pm == kGpuPmSuspended) { nv_rtd3_before_system_resume(); gpuResume(); }
@@ -2199,8 +2199,8 @@ void NVRM::gpuSuspend()
     // NVKMS first: once it is suspended no thread is inside it, so none can hold gKmsLock while it waits at the RM
     // gate (closing the gate first deadlocked against an NVKMS ioctl calling into RM).
     nvkms_xnu_suspend(fNv.gpu_id);
-    const int busy = nv_xnu_pm_close(10000);
-    if (busy) LOG("sleep #%u: %d RM call(s) still running after 10 s - suspending anyway", fPmCycles, busy);
+    const int busy = nv_xnu_pm_close(3000);
+    if (busy) LOG("sleep #%u: %d RM call(s) still running after 3 s - suspending anyway", fPmCycles, busy);
     // nv_preempt_user_channels(): with every VRAM allocation preserved, user channels must be idle and stopped
     // while their memory is copied out, and restarted once it is back.
     NV_STATUS cst = rm_stop_user_channels(NULL, &fNv);

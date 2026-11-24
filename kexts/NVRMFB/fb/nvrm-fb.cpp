@@ -287,6 +287,12 @@ public:
     bool doUpdate() override { return true; }
     void free() override;
     int restoreExternal(SInt32 level);
+    void reapplyAfterWake() {
+        SInt32 target = OSAddAtomic(0, &fUserLevel);
+        if (target < 0) return;
+        fPending = target;
+        if (fApply) thread_call_enter(fApply);
+    }
 };
 OSDefineMetaClassAndStructors(NVRMBacklightHandler, IODisplayParameterHandler)
 // The internal panel's handler, for debug.nvrmfb_backlight_restore. Set by publishBacklight once the handler is
@@ -795,6 +801,7 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     bool fPowerOn = true;                 // this framebuffer's own power state (display sleep / system sleep)
     bool fSysSlept = false;               // NVRM put the GPU in standby since this framebuffer last powered on
     uint8_t fWakeRetries = 0;
+    volatile SInt32 fGpuLost = 0;         // NVRM reported GPU lost on wake (NVRMGpuPower(2))
 
     thread_call_t fGpuWake = nullptr;
     static void gpuWakeFire(thread_call_param_t p0, thread_call_param_t);
@@ -1992,6 +1999,10 @@ void NVRMNVDAFramebuffer::surroundCheck()
         master->notifyConnectionChanged(500);
     }
 }
+// Post-resume hot-plug disconnect grace window: during the first 2.5 s after NVRM resumes the GPU, eDP/HDMI links may
+// still be retraining. Transient disconnects during this window are deferred and re-checked once after the grace expires
+// so a sleeping/retraining panel is not torn down (losing AppleBacklightDisplay or resetting external refresh rate).
+static volatile uint64_t gGpuResumeGraceUntil = 0;
 void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
 {
     NVRMNVDAFramebuffer *me = gFB;
@@ -2003,6 +2014,9 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
     struct NvKmsKapiDynamicDisplayParams *dd = (struct NvKmsKapiDynamicDisplayParams *)IOMalloc(sizeof *dd);
     if (!dd) return;
     int added = 0;
+    const uint64_t graceUntil = __atomic_load_n(&gGpuResumeGraceUntil, __ATOMIC_ACQUIRE);
+    const bool inResumeGrace = graceUntil && mach_absolute_time() < graceUntil;
+    bool deferredDisconnect = false;
     NVRMNVDAFramebuffer *relight[16]; unsigned nrelight = 0;
     NVRMNVDAFramebuffer *notify[16]; unsigned nnotify = 0;
     IORecursiveLock *sl = startLock();
@@ -2018,6 +2032,11 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
             // that was seen disconnected and is connected again gets its head lit with the same full mode set the
             // display-wake path uses (reflip). Only on that transition, so other display events cause no modeset.
             if (!dynOk) continue;
+            if (!dd->connected && inResumeGrace) {
+                deferredDisconnect = true;
+                FBLOG("hot-plug: display 0x%x disconnected during post-resume grace - deferring recheck", handles[i]);
+                continue;
+            }
             gDpy[kdpy].connected = dd->connected ? NV_TRUE : NV_FALSE;
             bool audioTypeChanged = false;
             if (dd->connected && kdpy >= 0) {
@@ -2087,6 +2106,11 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
         if (listed) continue;
         nvu_zero(dd, sizeof *dd); dd->handle = gDpy[k].handle;
         if (!me->fKms->getDynamicDisplayInfo(me->fDev, dd) || dd->connected) continue;
+        if (inResumeGrace) {
+            deferredDisconnect = true;
+            FBLOG("hot-plug: omitted display 0x%x disconnected during post-resume grace - deferring recheck", gDpy[k].handle);
+            continue;
+        }
         gDpy[k].connected = false;
         for (unsigned f = 0; f < sizeof gFBs / sizeof gFBs[0]; f++) {
             NVRMNVDAFramebuffer *fb = gFBs[f];
@@ -2103,6 +2127,12 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
         if (gFBs[i] && !gFBs[i]->fDpyLost) gFBs[i]->publishDisplayAudioProperties();
     if (sl) IORecursiveLockUnlock(sl);
     IOFree(dd, sizeof *dd);
+    if (deferredDisconnect && gHotplug) {
+        uint64_t margin = 0, recheck = graceUntil;
+        clock_interval_to_absolutetime_interval(200, kMillisecondScale, &margin);
+        recheck += margin;
+        thread_call_enter_delayed(gHotplug, recheck);
+    }
     for (unsigned f = 0; f < nnotify; f++) {
         notify[f]->notifyConnectionChanged(500);
         notify[f]->release();
@@ -5138,15 +5168,23 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
             if (fModeSet && fSurf) fHeadSlept = true;   // nvKmsSuspend shuts every head down
             fSysSlept = true;                            // the next power-on is a system wake (familyDidWake)
             fWakeRetries = 0;
+            __atomic_store_n(&fGpuLost, 0, __ATOMIC_RELEASE);
+            __atomic_store_n(&gGpuResumeGraceUntil, 0, __ATOMIC_RELEASE);
             if (gVramPoolN > 0 && fKms && fDev) {
                 NVRMDisplayGate gate;
                 if (gate.valid() && gVramPoolN > 0) vramPoolDrain(fKms, fDev);
             }
             FBLOG("GPU going to standby: head %u off with it", fHead);
         } else if (st == 1) {
+            __atomic_store_n(&fGpuLost, 0, __ATOMIC_RELEASE);
+            uint64_t grace = 0;
+            clock_interval_to_deadline(2500, kMillisecondScale, &grace);
+            __atomic_store_n(&gGpuResumeGraceUntil, grace, __ATOMIC_RELEASE);
             if (fGpuWake) scheduleCall(fGpuWake, 0);
         } else {
+            __atomic_store_n(&fGpuLost, 1, __ATOMIC_RELEASE);
             FBLOG("GPU lost on wake: head %u stays dark (restart needed)", fHead);
+            if (fGpuWake) scheduleCall(fGpuWake, 0);   // Guardrail B: still release WindowServer from pagingState wait
         }
         return kIOReturnSuccess;
     }
@@ -5664,7 +5702,10 @@ IOReturn NVRMNVDAFramebuffer::setPowerState(unsigned long ordinal, IOService *de
         // PS 0, every client's last event 3 = WillSleep). Do the family's wake work here instead; it delivers
         // DidPowerOn too. Only after a real system sleep: at start pagingState is still clear too, and the wake work
         // then sent every client a DidWake at boot.
-        if (!pagingState && fSysSlept) { fSysSlept = false; familyDidWake(); }
+        if (!pagingState && fSysSlept) {
+            if (rmGpuReady()) { fSysSlept = false; familyDidWake(); }
+            else FBLOG("system wake: GPU not resumed yet - deferring familyDidWake until NVRM resumes");
+        }
         else handleEvent(kIOFBNotifyDidPowerOn);
     } else {
         handleEvent(kIOFBNotifyWillPowerOff);
@@ -5717,6 +5758,7 @@ void NVRMNVDAFramebuffer::familyDidWake()
     }
     IOReturn r = fWakeGate->runAction(OSMemberFunctionCast(IOCommandGate::Action, this, &NVRMNVDAFramebuffer::familyDidWakeGated));
     FBLOG("system wake: family wake work -> 0x%x", r);
+    if (fInternal && fBacklight && rmGpuReady()) fBacklight->reapplyAfterWake();
 }
 IOReturn NVRMNVDAFramebuffer::sleepTap(OSObject *self, void *, IOFramebuffer *, IOIndex event, void *info)
 {
@@ -5766,30 +5808,47 @@ void NVRMNVDAFramebuffer::gpuWakeFire(thread_call_param_t p0, thread_call_param_
     NVRMNVDAFramebuffer *me = (NVRMNVDAFramebuffer *)p0;
     NVRMCallReference callReference(me);
     if (OSAddAtomic(0, &me->fStopping)) return;
-    bool ok = false, wakeFam = false;
+    bool ok = false, wakeFam = false, reapplyBl = false;
     {
         NVRMDisplayGate gate; if (!gate.valid()) return;
-        if (!me->fHeadSlept || !me->fPowerOn || !me->fModeSet || !me->fSurf) {
-            FBLOG("GPU back: head %u left as is (slept %u, power %u)", me->fHead, (unsigned)me->fHeadSlept, (unsigned)me->fPowerOn);
-            return;
-        }
-        ok = me->setHeadPower(true);   // a rejected wake stays retryable on the next power request
-        FBLOG("GPU back: head %u re-lit -> %s", me->fHead, ok ? "ok" : "FAILED");
-        if (ok) {
-            me->fWakeRetries = 0;
+        if (__atomic_load_n(&me->fGpuLost, __ATOMIC_ACQUIRE)) {
             if (!me->pagingState && me->fSysSlept) {
                 me->fSysSlept = false;
                 wakeFam = true;
             }
-        } else if (me->fWakeRetries < 3) {
-            me->fWakeRetries++;
-            uint64_t deadline = 0;
-            clock_interval_to_deadline(500u * me->fWakeRetries, kMillisecondScale, &deadline);
-            FBLOG("GPU back: head %u wake retry %u/3 scheduled in %u ms", me->fHead, (unsigned)me->fWakeRetries, 500u * me->fWakeRetries);
-            me->scheduleCall(me->fGpuWake, deadline);
+            FBLOG("GPU lost on wake: head %u stays dark%s", me->fHead, wakeFam ? " - waking family so WindowServer cannot deadlock" : "");
+        } else if (!me->fHeadSlept || !me->fPowerOn || !me->fModeSet || !me->fSurf) {
+            if (me->fPowerOn && !me->pagingState && me->fSysSlept) {
+                me->fSysSlept = false;
+                wakeFam = true;
+            }
+            FBLOG("GPU back: head %u left as is (slept %u, power %u)", me->fHead, (unsigned)me->fHeadSlept, (unsigned)me->fPowerOn);
+        } else {
+            ok = me->setHeadPower(true);   // a rejected wake stays retryable on the next power request
+            FBLOG("GPU back: head %u re-lit -> %s", me->fHead, ok ? "ok" : "FAILED");
+            if (ok) {
+                me->fWakeRetries = 0;
+                reapplyBl = me->fInternal && me->fBacklight != nullptr;
+                if (!me->pagingState && me->fSysSlept) {
+                    me->fSysSlept = false;
+                    wakeFam = true;
+                }
+            } else if (me->fWakeRetries < 3) {
+                me->fWakeRetries++;
+                uint64_t deadline = 0;
+                clock_interval_to_deadline(500u * me->fWakeRetries, kMillisecondScale, &deadline);
+                FBLOG("GPU back: head %u wake retry %u/3 scheduled in %u ms", me->fHead, (unsigned)me->fWakeRetries, 500u * me->fWakeRetries);
+                me->scheduleCall(me->fGpuWake, deadline);
+            } else if (!me->pagingState && me->fSysSlept) {
+                // Guardrail B: on final retry exhaustion still release WindowServer from its pagingState wait.
+                me->fSysSlept = false;
+                wakeFam = true;
+                FBLOG("GPU back: head %u wake retries exhausted - waking family so WindowServer cannot deadlock", me->fHead);
+            }
         }
     }
     if (wakeFam) me->familyDidWake();
+    else if (reapplyBl && me->fBacklight) me->fBacklight->reapplyAfterWake();
 }
 IOReturn NVRMNVDAFramebuffer::setAttributeForConnection(IOIndex connectIndex, IOSelect attribute, uintptr_t value)
 {

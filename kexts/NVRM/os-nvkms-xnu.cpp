@@ -424,15 +424,34 @@ static void kms_timer_execute_batch(nvkms_timer_t **batch, unsigned count)
 static void kms_timer_enqueue(nvkms_timer_t *t)
 {
     bool kick = false;
+    struct nvkms_ref_ptr *dupRef = NULL;
     IOSimpleLockLock(gKmsTimerQueueLock);
-    t->next = NULL;
-    if (gKmsTimerTail) gKmsTimerTail->next = t;
-    else gKmsTimerHead = t;
-    gKmsTimerTail = t;
-    gKmsTimerDepth++;
-    if (gKmsTimerDepth > gKmsTimerMaxDepth) gKmsTimerMaxDepth = gKmsTimerDepth;
-    if (!gKmsTimerWorkerActive) { gKmsTimerWorkerActive = true; kick = true; }
+    // Coalesce duplicate pending zero-delay ref-ptr callbacks (e.g. NonStallInterruptCallback bursts)
+    // so redundant wakes do not hammer gKmsLock; plain handle-owned timers are never coalesced.
+    if (t->isRefPtr && !t->call) {
+        for (nvkms_timer_t *q = gKmsTimerHead; q; q = q->next) {
+            if (q->isRefPtr && !q->cancel && q->proc == t->proc &&
+                q->dataPtr == t->dataPtr && q->dataU32 == t->dataU32) {
+                dupRef = (struct nvkms_ref_ptr *)t->dataPtr;
+                break;
+            }
+        }
+    }
+    if (!dupRef) {
+        t->next = NULL;
+        if (gKmsTimerTail) gKmsTimerTail->next = t;
+        else gKmsTimerHead = t;
+        gKmsTimerTail = t;
+        gKmsTimerDepth++;
+        if (gKmsTimerDepth > gKmsTimerMaxDepth) gKmsTimerMaxDepth = gKmsTimerDepth;
+        if (!gKmsTimerWorkerActive) { gKmsTimerWorkerActive = true; kick = true; }
+    }
     IOSimpleLockUnlock(gKmsTimerQueueLock);
+    if (dupRef) {
+        (void)nvkms_dec_ref(dupRef);
+        kms_timer_release(t);
+        return;
+    }
     if (kick) thread_call_enter(gKmsTimerWorker);
 }
 static void kms_timer_drain(thread_call_param_t, thread_call_param_t)
