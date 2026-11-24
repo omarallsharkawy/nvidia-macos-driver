@@ -497,6 +497,10 @@ static void nvmtl_nvencvt_register(bool decodersOnly)
             nvlog("nvencvt: NVMTL_NO_NVDEC set - not registering decoders in %s", me);
             return;
         }
+        if (decOnly && nvmtl_decode_is_delegated(me)) {
+            nvlog("nvencvt: %s is a sandboxed Apple process - not registering in-process decoders (delegates to VTDecoderXPCService)", me);
+            return;
+        }
         Dl_info di;
         if (!dladdr((const void *)nvmtl_nvencvt_register, &di) || !di.dli_fname) { nvlog("nvencvt: dladdr failed - not registering"); return; }
         char dir[1024], path[1200];
@@ -1455,7 +1459,8 @@ static id<MTLTexture> nvmtl_make_y422_texture(MTLTextureDescriptor *d, NVMTLText
 
 typedef struct { uint32_t magic, seed, gen; } nvmtl_vram_tag;
 #define NVMTL_VRAM_MAGIC 0x564d5634u
-static unsigned long long g_surf_vram, g_surf_private, g_surfin_skip, g_surfin_copy;
+static _Atomic unsigned long long g_surf_vram, g_surf_private;
+static unsigned long long g_surfin_skip, g_surfin_copy;
 static CFStringRef nvmtl_vram_tag_key(NSUInteger plane) {
     static const CFStringRef k[4] = { CFSTR("NVMTLVramAt:p0"), CFSTR("NVMTLVramAt:p1"), CFSTR("NVMTLVramAt:p2"), CFSTR("NVMTLVramAt:p3") };
     return plane < 4 ? (CFStringRef)CFRetain(k[plane]) : CFStringCreateWithFormat(NULL, NULL, CFSTR("NVMTLVramAt:p%lu"), (unsigned long)plane);
@@ -1495,14 +1500,14 @@ static void nvmtl_vram_tag_set(IOSurfaceRef surf, NSUInteger plane, uint32_t see
 }
 typedef struct { uint32_t magic, done; uint64_t stamp_ns, seq; int32_t pid; uint32_t pad; } nvmtl_busy_tag;
 #define NVMTL_BUSY_MAGIC 0x4255535au
-#define NVMTL_BUSY_WAIT_NS  (35ull * 1000 * 1000)
+#define NVMTL_BUSY_WAIT_NS  (12ull * 1000 * 1000)
 #define NVMTL_BUSY_STALE_NS (100ull * 1000 * 1000)
 #define NVMTL_BUSY_POLL_US 100
 static uint64_t nvmtl_busy_wait_limit_ns(void)
 {
     static uint64_t lim; static dispatch_once_t once;
     dispatch_once(&once, ^{
-        uint64_t ms = 35;
+        uint64_t ms = 12;
         const char *e = getenv("NVMTL_BUSY_WAIT_MS");
         if (e && *e) {
             unsigned long long v = strtoull(e, NULL, 10);
@@ -1698,20 +1703,22 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
             nvk_buffer vb;
             if (!nvmtl_ic_get(surf, row * h, &vb)) {
                 if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &vb, 0, row, &t->_i)) {
-                    t->_vramBuf = vb; t->_vramOn = YES; g_surf_vram++;
+                    t->_vramBuf = vb; t->_vramOn = YES;
+                    const unsigned long long nv = atomic_fetch_add_explicit(&g_surf_vram, 1, memory_order_relaxed) + 1;
                     uint32_t seed = IOSurfaceGetSeed(surf);
                     int current = nvmtl_vram_tag_current(surf, 0, seed);
                     if (current) { t->_surfSeed = seed; t->_surfSynced = YES; }
-                    static unsigned n; if (n++ < 8 || n % 2000 == 0)
+                    static _Atomic unsigned n; const unsigned k = atomic_fetch_add_explicit(&n, 1, memory_order_relaxed);
+                    if (k < 8 || k % 2000 == 0)
                         nvlog("item 7: surface %u %ux%u pitch %zu -> the family's VRAM%s (vram %llu, private %llu)", (unsigned)IOSurfaceGetID(surf),
-                              w, h, row, current ? ", already current (no upload)" : "", g_surf_vram, g_surf_private);
+                              w, h, row, current ? ", already current (no upload)" : "", nv, atomic_load_explicit(&g_surf_private, memory_order_relaxed));
                     return 0;
                 }
                 if (!nvmtl_ic_put(&vb)) nvmtl_vk_buffer_destroy(&vb);
             }
         }
     }
-    g_surf_private++;
+    atomic_fetch_add_explicit(&g_surf_private, 1, memory_order_relaxed);
     // A private image stands for the whole surface: wrappers that read it and wrappers that write it must share ONE image
     // (nvmtlNewSurfaceTexture caches it), or what one writes the other never sees. So it is made writable whenever the
     // format can be, whatever the first wrapper asked for.
@@ -1747,12 +1754,13 @@ static NSUInteger nvmtl_surface_usage(NSUInteger usage, BOOL fbo, BOOL storage) 
 
 static char nvmtl_surface_cache_key;
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surf plane:(NSUInteger)plane {
+    NSMapTable *cache;
     @synchronized(self) {
-        NSMapTable *cache = objc_getAssociatedObject(self, &nvmtl_surface_cache_key);
+        cache = objc_getAssociatedObject(self, &nvmtl_surface_cache_key);
         if (!cache) { cache = [NSMapTable strongToWeakObjectsMapTable];
             objc_setAssociatedObject(self, &nvmtl_surface_cache_key, cache, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
-        return [self nvmtlNewSurfaceTexture:d surface:surf plane:plane cache:cache];
     }
+    return [self nvmtlNewSurfaceTexture:d surface:surf plane:plane cache:cache];
 }
 - (id<MTLTexture>)nvmtlNewSurfaceTexture:(MTLTextureDescriptor *)d surface:(IOSurfaceRef)surf plane:(NSUInteger)plane cache:(NSMapTable *)cache {
     if (nvmtl_vk_init()) return nil;
@@ -1773,8 +1781,13 @@ static char nvmtl_surface_cache_key;
     uint32_t vkf = 0, bpp = 0; int a8 = 0;
     if (nvmtl_pixfmt(d.pixelFormat, &vkf, &bpp, &a8)) return nil;
     int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
-    NSArray *key = (surf && cache.count > 0) ? @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)] : nil;
-    NVMTLTexture *backing = key ? [cache objectForKey:key] : nil;
+    NSArray *key = surf ? @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)] : nil;
+    NVMTLTexture *backing = nil;
+    if (key) {
+        @synchronized(self) {
+            if (cache.count > 0) backing = [cache objectForKey:key];
+        }
+    }
     // Failed BAR imports use a private image. Repeated wrappers of the same
     // surface must share that image, just as successful family imports do,
     // whether a wrapper reads it or writes it (the image is made writable).
@@ -1796,9 +1809,21 @@ static char nvmtl_surface_cache_key;
     t->_stex = t->_i.storage == 1;
     t->_usage = nvmtl_surface_usage(d.usage, t->_fbo, t->_stex);
     nvmtl_texture_desc_swizzle(t, d);
-    if (surf && !t->_vramOn) {
-        if (!key) key = @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)];
-        [cache setObject:t forKey:key];
+    if (surf && !t->_vramOn && key) {
+        NVMTLTexture *won = nil;
+        @synchronized(self) {
+            NVMTLTexture *existing = [cache objectForKey:key];
+            if (existing && !existing->_vramOn) won = existing;
+            else [cache setObject:t forKey:key];
+        }
+        if (won) {
+            NVMTLTexture *alias = (NVMTLTexture *)[won newTextureViewWithPixelFormat:d.pixelFormat];
+            if (alias) {
+                alias->_viewParent = nil; alias->_usage = nvmtl_surface_usage(d.usage, t->_fbo, alias->_stex); alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
+                nvmtl_texture_desc_swizzle(alias, d);
+                return alias;
+            }
+        }
     }
     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
           (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);

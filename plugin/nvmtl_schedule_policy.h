@@ -20,13 +20,26 @@ static inline int nvmtl_schedule_after_mode(const char *setting, const char *pro
     return nvmtl_schedule_is_chromium_family(process) ? 1 : 3;
 }
 
-/* Publish every non-drawable cross-process IOSurface write before reporting "scheduled" for all client apps
-   (Electron helpers, WebKit, App Store, Safari, Cocoa scroll views), while keeping WindowServer on mode 3.
-   NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=0..3 still overrides in every process. */
+/* Browser and Electron GPU helper processes hand layers across processes from scheduled callbacks without NVMTLBusyAt
+   ordering, so they keep mode 1 (publish every surface write before reporting "scheduled"). */
+static inline int nvmtl_schedule_is_ui_browser_family(const char *process)
+{
+    if (!process || !*process) return 0;
+    if (nvmtl_schedule_is_chromium_family(process)) return 1;
+    return strstr(process, "Helper (GPU)") || strstr(process, "Electron")
+        || strstr(process, "Brave") || strstr(process, "Opera")
+        || strstr(process, "Arc") || strstr(process, "Vivaldi");
+}
+
+/* Mode 3 for WindowServer, mode 1 for Chromium/Electron GPU helpers (which rely on scheduledHandlers for cross-process
+   layer handoff), and mode 2 for native macOS apps (App Store, NotificationCenter, WidgetRenderer, Safari, Finder):
+   private/non-VRAM copy-out surfaces still publish before "scheduled", while shared family-VRAM surfaces pipeline and
+   synchronize via NVMTLBusyAt + nvmtlSurfaceIn. NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=0..3 still overrides everywhere. */
 static inline int nvmtl_schedule_after_mode_ui(const char *setting, const char *process)
 {
     if (setting && setting[0] >= '0' && setting[0] <= '3' && !setting[1]) return setting[0] - '0';
     if (!process || !*process || !strcmp(process, "WindowServer")) return 3;
-    return 1;
+    if (nvmtl_schedule_is_ui_browser_family(process)) return 1;
+    return 2;
 }
 #endif

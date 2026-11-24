@@ -552,6 +552,7 @@ static int nvmtl_skip_empty_on(void) {
     // Applications may retain completed command buffers. Pending overwrite
     // bookkeeping must not keep their IOSurfaces and VRAM alive indefinitely.
     [_surfOverwrites removeAllObjects]; _surfOverwrites = nil;
+    [_surfWaited removeAllObjects]; _surfWaited = nil;
     if (!error) nvmtl_res2_cb_done(self);
     [self nvmtlReleaseCapacity];
 }

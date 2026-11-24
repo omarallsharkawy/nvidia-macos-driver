@@ -706,7 +706,7 @@ static NSString *nvmtl_spvcache_path(NSData *air, NSString *stage) {
  * on every transfer, so the same module was converted to UTF-8 and hashed three times per dispatch (function, reflection,
  * variant). Hash the module once, keep the hash state on the NSString that holds it, and finish each key from that state:
  * the digests, and so the file names, are the ones the one-shot hash gave. */
-@interface NVMTLAirDigest : NSObject { @public CC_SHA256_CTX _ctx; }
+@interface NVMTLAirDigest : NSObject { @public CC_SHA256_CTX _ctx; uint8_t _digest[CC_SHA256_DIGEST_LENGTH]; }
 @end
 @implementation NVMTLAirDigest
 @end
@@ -746,8 +746,16 @@ static NVMTLAirDigest *nvmtl_air_state(NSString *ll) {
     CC_SHA256_Update(&d->_ctx, &size, sizeof size);
     for (NSUInteger off = 0; off < air.length; off += 1u << 30)
         CC_SHA256_Update(&d->_ctx, (const char *)air.bytes + off, (CC_LONG)MIN((NSUInteger)1u << 30, air.length - off));
+    CC_SHA256_CTX fin = d->_ctx;
+    CC_SHA256_Final(d->_digest, &fin);
     if (cacheable) objc_setAssociatedObject(ll, NVMTL_AIRDIGEST_KEY, d, OBJC_ASSOCIATION_RETAIN);
     return d;
+}
+static BOOL nvmtl_air_state_digest(NSString *ll, uint8_t out[32]) {
+    NVMTLAirDigest *ad = nvmtl_air_state(ll);
+    if (!ad) return NO;
+    memcpy(out, ad->_digest, CC_SHA256_DIGEST_LENGTH);
+    return YES;
 }
 static NSString *nvmtl_spvcache_path_air(NVMTLAirDigest *ad, NSData *tail, NSString *stage) {
     CC_SHA256_CTX c = ad->_ctx;

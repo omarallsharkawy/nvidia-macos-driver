@@ -31,3 +31,4 @@ static id nvmtl_mesh_fail(NSError **err, NSString *why);
 static NSData *nvmtl_mesh_translate(NSString *ll, NSString *stage, NSString **why);
 static NSData *nvmtl_mesh_translate_fc(NSString *ll, NSString *stage, NSDictionary *fc, NSString **why);
 static NSString *nvmtl_mesh_text(uint8_t *p, size_t n);
+static BOOL nvmtl_air_state_digest(NSString *ll, uint8_t out[32]);

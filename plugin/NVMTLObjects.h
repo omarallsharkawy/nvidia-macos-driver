@@ -65,6 +65,7 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); if (b->
 - (void *)nvview;
 - (void *)nvsampleview;
 - (void)nvmtlSurfaceIn;
+- (void)nvmtlSurfaceInSkipBusy:(BOOL)skipBusy;
 - (BOOL)nvmtlSurfaceOut;
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied;
 @end
@@ -138,6 +139,7 @@ extern id gNVMTLMainDevice;
   NSMutableSet *_resources;
   NSMutableSet *_surfDirty;
   NSMutableSet *_surfOverwrites; // contents defined by writes recorded in this command buffer
+  NSMutableSet *_surfWaited;     // root IOSurface textures already checked for foreign NVMTLBusyAt in this CB
   unsigned _nEnc, _nEnd, _nHandlers, _nStatus, _nEnqueue, _nLabel, _nPresent, _nWait;
   unsigned _nEncSealed;
   CFTimeInterval _gpuStart, _gpuEnd;

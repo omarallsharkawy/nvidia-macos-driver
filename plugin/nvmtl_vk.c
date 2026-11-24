@@ -4116,8 +4116,17 @@ static int nvmtl_dwit_ready(void)
 static int nvmtl_order_barrier_on(void)
 {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("NVMTL_NO_ORDER_BARRIER"); on = !(e && e[0] == '1');
-        nvlog("vk: ordering barrier after every compute dispatch and render pass %s", on ? "ON" : "OFF (NVMTL_NO_ORDER_BARRIER=1)"); }
+    if (on < 0) {
+        const char *e = getenv("NVMTL_NO_ORDER_BARRIER");
+        const char *ws = getenv("NVMTL_ORDER_BARRIER_WS");
+        const char *me = getprogname();
+        const int is_ws = me && !strcmp(me, "WindowServer");
+        if (e && e[0] == '1') on = 0;
+        else if (is_ws) on = (ws && ws[0] == '1') ? 1 : 0;
+        else on = 1;
+        nvlog("vk: ordering barrier after every compute dispatch and render pass %s",
+              on ? "ON" : is_ws ? "OFF in WindowServer (NVMTL_ORDER_BARRIER_WS=1 re-enables)" : "OFF (NVMTL_NO_ORDER_BARRIER=1)");
+    }
     return on;
 }
 static void nvmtl_order_barrier(nvk_cmdbuf *c)

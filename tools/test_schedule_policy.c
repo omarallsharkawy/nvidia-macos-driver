@@ -21,5 +21,24 @@ int main(void)
     ARM("a setting that is not a single digit 0..3 is ignored, not turned into a mode no path knows",
         nvmtl_schedule_after_mode("x", "WindowServer") == 3 && nvmtl_schedule_after_mode("7", "WindowServer") == 3 &&
         nvmtl_schedule_after_mode("12", "Google Chrome") == 1);
+    ARM("UI policy: WindowServer keeps mode 3, Chromium/Electron/browser GPU helpers keep mode 1, native macOS apps use mode 2",
+        nvmtl_schedule_after_mode_ui(NULL, "WindowServer") == 3 && nvmtl_schedule_after_mode_ui(NULL, NULL) == 3 &&
+        nvmtl_schedule_after_mode_ui(NULL, "") == 3 &&
+        nvmtl_schedule_after_mode_ui(NULL, "Google Chrome Helper (GPU)") == 1 &&
+        nvmtl_schedule_after_mode_ui(NULL, "Antigravity Helper (GPU)") == 1 &&
+        nvmtl_schedule_after_mode_ui(NULL, "Discord Helper (GPU)") == 1 &&
+        nvmtl_schedule_after_mode_ui(NULL, "Electron") == 1 &&
+        nvmtl_schedule_after_mode_ui(NULL, "Brave Browser") == 1 &&
+        nvmtl_schedule_after_mode_ui(NULL, "Opera") == 1 &&
+        nvmtl_schedule_after_mode_ui(NULL, "Arc") == 1 &&
+        nvmtl_schedule_after_mode_ui(NULL, "Vivaldi") == 1 &&
+        nvmtl_schedule_after_mode_ui(NULL, "App Store") == 2 &&
+        nvmtl_schedule_after_mode_ui(NULL, "NotificationCenter") == 2 &&
+        nvmtl_schedule_after_mode_ui(NULL, "WidgetRenderer") == 2 &&
+        nvmtl_schedule_after_mode_ui(NULL, "Safari") == 2 &&
+        nvmtl_schedule_after_mode_ui(NULL, "Finder") == 2);
+    ARM("UI policy: explicit 0..3 overrides in every process",
+        nvmtl_schedule_after_mode_ui("0", "App Store") == 0 && nvmtl_schedule_after_mode_ui("1", "App Store") == 1 &&
+        nvmtl_schedule_after_mode_ui("3", "Electron") == 3 && nvmtl_schedule_after_mode_ui("2", "WindowServer") == 2);
     return fails ? 1 : 0;
 }

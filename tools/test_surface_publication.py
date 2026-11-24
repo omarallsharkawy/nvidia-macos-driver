@@ -92,6 +92,7 @@ static int nvmtl_vk_image_read(void *q, Image *i, void *base, size_t row) {
 - (void)nvmtlY422SurfaceIn;
 - (BOOL)nvmtlSurfaceCopyable;
 - (void)nvmtlSurfaceIn;
+- (void)nvmtlSurfaceInSkipBusy:(BOOL)skipBusy;
 - (BOOL)nvmtlSurfaceOut;
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied;
 @end
@@ -160,6 +161,12 @@ int main(int argc, char **argv) { @autoreleasepool {
     assert(busyWaits==1 && c->_clientWritten);
     busyForeign=0; cs.seed++; [c nvmtlSurfaceIn];
     assert(busyWaits==2);
+    // reused shared-VRAM surface whose seed has not moved yet while a foreign GPU write is in flight must still wait
+    Surface vs={.seed=7}; NVMTLTexture *v=[NVMTLTexture new]; v->_surf=&vs; v->_vramOn=YES; v->_surfSynced=YES; v->_surfSeed=7; v->_i=(Image){.w=1,.h=1,.bpp=4};
+    busyWaits=0; busyForeign=1; [v nvmtlSurfaceIn];
+    assert(busyWaits==1 && v->_clientWritten);
+    busyWaits=0; [v nvmtlSurfaceInSkipBusy:YES];
+    assert(busyWaits==0);
     puts("PASS: overlapping publication preserves GPU pixels; later CPU edits import; a publication after the commit's "
          "VRAM mark never waits for the accelerator lock and retries a busy re-mark off its thread; another process's "
          "write is waited for before import");
