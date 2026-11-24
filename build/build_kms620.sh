@@ -9,12 +9,14 @@ cd "$B/ogkm-$V/src/nvidia-modeset" || exit 2
 O=_out/Darwin_x86_64; mkdir -p "$O"
 make -n TARGET_OS=Darwin TARGET_ARCH=x86_64 NV_VERBOSE=1 2>/dev/null > "$B/kms-make-n.txt"
 grep " -c " "$B/kms-make-n.txt" | python3 -c '
-import sys
+import re, sys
 for l in sys.stdin:
     l = l.rstrip("\n")
     cc, rest = l.split(" ", 1)
     tool = {"cc": "clang", "c++": "clang++"}[cc]   # the DisplayPort library is C++
-    print(tool + " -arch x86_64 -mmacosx-version-min=15.0 -mkernel -DNV_DARWIN -fcf-protection=branch " + rest.replace(" -mcmodel=kernel", "").replace(" -fno-pic", ""))' > "$O/compile_cmds.sh"
+    rest = rest.replace(" -mcmodel=kernel", "").replace(" -fno-pic", "")
+    rest = re.sub(r" -m(?:function-return|indirect-branch|harden-sls)[^ ]*", "", rest)
+    print(tool + " -arch x86_64 -mmacosx-version-min=15.0 -mkernel -DNV_DARWIN -fcf-protection=branch " + rest)' > "$O/compile_cmds.sh"
 n=$(wc -l < "$O/compile_cmds.sh" | tr -d " "); echo "modeset compile commands: $n"
 # the identity string is a make step (user@host and the date); write the shipped wording instead
 printf '%s\n' 'const char  NV_KMS_ID[] = "nvidia id: NVIDIA UNIX Open Kernel Mode Setting Driver for x86_64 '"$V"' Release Build (NullMoth Systems)";' \

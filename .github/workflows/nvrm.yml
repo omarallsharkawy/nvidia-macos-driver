@@ -10,10 +10,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - name: Pick newest Xcode 16 (avoids Xcode 26 ___x86_return_thunk in kexts)
+      - name: Pick the newest Xcode
         run: |
           ls -d /Applications/Xcode*.app
-          X=$(ls -d /Applications/Xcode_16*.app | sort -V | tail -1); echo "using $X"
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); echo "using $X"
           sudo xcode-select -s "$X/Contents/Developer"; xcrun clang --version; xcrun --sdk macosx --show-sdk-version
       - name: Build NVIDIA open-gpu-kernel-modules RM & NVKMS archives (620.70.06)
         run: |

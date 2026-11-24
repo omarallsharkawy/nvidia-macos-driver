@@ -57,12 +57,13 @@ grep -E "^echo .*version\.h" "$B/make-n.txt" > "$B/pre.sh"; bash "$B/pre.sh"
 printf '%s\n' 'const char  NVRM_ID[] = "nvidia id: NVIDIA UNIX Open Kernel Module for x86_64 '"$V"' Release Build (NullMoth Systems)";' \
   'const char *const pNVRM_ID =  NVRM_ID + 11;' > "$O/g_nvid_string.c"
 grep " -c " "$B/make-n.txt" | python3 -c '
-import sys
+import re, sys
 for l in sys.stdin:
     l = l.rstrip("\n")
     assert l.startswith("cc "), l[:40]
     l = "clang -arch x86_64 -mmacosx-version-min=15.0 -mkernel -DNV_DARWIN -fcf-protection=branch " + l[3:]
     l = l.replace(" -mcmodel=kernel", "").replace(" -fno-pic", "")
+    l = re.sub(r" -m(?:function-return|indirect-branch|harden-sls)[^ ]*", "", l)
     print(l)' > "$O/compile_cmds.sh"
 n=$(wc -l < "$O/compile_cmds.sh"); echo "compile commands: $n"
 rm -rf "$O/.err"; mkdir -p "$O/.err"
