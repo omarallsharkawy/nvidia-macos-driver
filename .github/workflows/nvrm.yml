@@ -6,7 +6,7 @@ on:
     paths: ['kexts/NVRM/*.cpp', 'kexts/NVRM/*.c', 'kexts/NVRM/*.h', 'kexts/NVRM/*.py', 'kexts/NVRM/Info.plist', 'kexts/NVRM/patches/**', '.github/workflows/nvrm.yml']
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
